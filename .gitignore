@@ -1,0 +1,41 @@
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Logs and outputs
+*.log
+logs/
+outputs/
+runs/
+
+# Model weights / checkpoints / large artifacts
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.safetensors
+checkpoints/
+
+# Data (keep out of git by default)
+data/
+datasets/
+
+# Embeddings / generated artifacts (often large)
+embeddings/
+**/embeddings/
+
+# Archives
+*.zip
+*.tar
+*.tar.gz
+

@@ -270,11 +270,12 @@ def save_checkpoint(
         torch.save(ckpt, best_path)
 
 
-def plot_loss_curve(losses: Sequence[float], save_path: Path):
+def plot_loss_curve(losses: Sequence[float], save_path: Path, epochs: Sequence[int] | None = None):
     import matplotlib.pyplot as plt
 
     plt.figure(figsize=(10, 6))
-    plt.plot(losses, linewidth=2)
+    x = epochs if epochs is not None and len(epochs) == len(losses) else list(range(1, len(losses) + 1))
+    plt.plot(x, losses, linewidth=2)
     plt.xlabel("Epoch")
     plt.ylabel("Loss")
     plt.title("SupCon Training Loss")
@@ -399,6 +400,7 @@ def main():
         resume_path = Path(args.resume).resolve()
         if not resume_path.exists():
             raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
+        # Use same run dir so checkpoints and loss_log continue in .../run_dir/checkpoints/
         out_dir = resume_path.parent.parent  # .../checkpoints/file.pt -> .../run_dir
         print(f"Resuming from {resume_path}; output directory: {out_dir}")
     elif args.experiment_name:
@@ -476,6 +478,7 @@ def main():
 
     start_epoch = 1
     losses: List[float] = []
+    epochs_logged: List[int] = []  # actual epoch number for each loss (so logs are correct when resuming without log file)
     best_loss = float("inf")
 
     if args.resume:
@@ -498,13 +501,26 @@ def main():
                 print(f"Warning: could not load scaler state: {e}")
         start_epoch = int(ckpt.get("epoch", 0)) + 1
         print(f"Resuming from epoch {start_epoch}")
+        # Optional: restore loss history so curve and best_loss continue. If no log file, we start fresh from here.
         log_file = out_dir / "loss_log.json"
         if log_file.exists():
-            with open(log_file, "r") as f:
-                log = json.load(f)
-            losses = log.get("losses", [])
-            best_loss = float(log.get("best_loss", float("inf")))
-            print(f"Restored loss history: {len(losses)} epochs, best_loss={best_loss:.4f}")
+            try:
+                with open(log_file, "r") as f:
+                    log = json.load(f)
+                losses = log.get("losses", [])
+                best_loss = float(log.get("best_loss", float("inf")))
+                # epochs_logged: use saved list or infer 1..len(losses) for backward compatibility
+                epochs_logged = log.get("epochs", list(range(1, len(losses) + 1)) if losses else [])
+                if len(epochs_logged) != len(losses):
+                    epochs_logged = list(range(1, len(losses) + 1)) if losses else []
+                print(f"Restored loss history: {len(losses)} epochs, best_loss={best_loss:.4f}")
+            except Exception as e:
+                print(f"Warning: could not load loss_log.json ({e}), starting logs from epoch {start_epoch}")
+                losses = []
+                epochs_logged = []
+                best_loss = float("inf")
+        else:
+            print(f"No loss_log.json found; creating new logs from epoch {start_epoch}")
 
     for epoch in range(start_epoch, args.epochs + 1):
         model.train()
@@ -546,18 +562,21 @@ def main():
 
         avg_loss = running / max(1, count)
         losses.append(avg_loss)
+        epochs_logged.append(epoch)
         is_best = avg_loss < best_loss
         if is_best:
             best_loss = avg_loss
 
-        # write loss log each epoch
+        # write loss log each epoch; epochs_logged are actual epoch numbers (correct when resuming without log)
+        best_idx = int(np.argmin(np.array(losses))) if losses else 0
+        best_epoch = int(epochs_logged[best_idx]) if losses else epoch
         with open(out_dir / "loss_log.json", "w") as f:
             json.dump(
                 {
-                    "epochs": list(range(1, epoch + 1)),
+                    "epochs": epochs_logged,
                     "losses": losses,
                     "best_loss": best_loss,
-                    "best_epoch": int(np.argmin(np.array(losses)) + 1),
+                    "best_epoch": best_epoch,
                     "batch_size": batch_size,
                     "classes_per_batch": args.classes_per_batch,
                     "samples_per_class": args.samples_per_class,
@@ -584,8 +603,8 @@ def main():
 
         print(f"Epoch {epoch}: avg_loss={avg_loss:.4f} (best={best_loss:.4f})")
 
-    # plot
-    plot_loss_curve(losses, out_dir / "loss_curve.png")
+    # plot (use epochs_logged so x-axis is correct when resuming without log)
+    plot_loss_curve(losses, out_dir / "loss_curve.png", epochs=epochs_logged)
 
     # save config
     with open(out_dir / "config.json", "w") as f:

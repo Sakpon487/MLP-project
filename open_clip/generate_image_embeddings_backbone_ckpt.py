@@ -5,6 +5,9 @@ Generate image embeddings using a finetuned CLIP backbone checkpoint.
 This script is paired with:
   - train_clip_supcon_backbone.py
 
+Supports --device cuda, mps (Apple Silicon), or cpu. ResNet models
+automatically use CPU when MPS is requested (MPS has compatibility issues).
+
 Input txt format:
   image_id class_id super_class_id path
 
@@ -84,11 +87,37 @@ def main():
     parser.add_argument("--model", type=str, default="ViT-B/32")
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to *.pt checkpoint from train_clip_supcon_backbone.py")
     parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", choices=["cuda", "cpu"])
+    def _default_device():
+        if torch.cuda.is_available():
+            return "cuda"
+        if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+            return "mps"
+        return "cpu"
+
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        choices=["cuda", "mps", "cpu"],
+        help="Device (default: cuda if available, else mps, else cpu). ResNet models auto-use CPU when --device mps.",
+    )
     parser.add_argument("--output-dir", type=str, default="./embeddings")
     parser.add_argument("--output-prefix", type=str, default=None)
     parser.add_argument("--normalize", action="store_true", default=True, help="L2-normalize embeddings (default: True)")
     args = parser.parse_args()
+
+    if args.device is None:
+        args.device = _default_device()
+
+    # MPS fallback if unavailable
+    if args.device == "mps" and (not getattr(torch.backends, "mps", None) or not torch.backends.mps.is_available()):
+        print("Warning: MPS requested but not available, using CPU.")
+        args.device = "cpu"
+
+    # ResNet models have fatal MPS compatibility issues; use CPU before loading
+    if args.device == "mps" and args.model.strip().upper().startswith("RN"):
+        print("Warning: ResNet models have MPS compatibility issues. Using CPU.")
+        args.device = "cpu"
 
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():

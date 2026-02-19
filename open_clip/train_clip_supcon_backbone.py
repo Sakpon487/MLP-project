@@ -163,7 +163,7 @@ class SupConLoss(nn.Module):
         self.base_temperature = float(base_temperature)
 
     def forward(self, features: torch.Tensor, labels: torch.Tensor | None = None, mask: torch.Tensor | None = None):
-        device = torch.device("cuda") if features.is_cuda else torch.device("cpu")
+        device = features.device
 
         if len(features.shape) < 3:
             raise ValueError("`features` needs to be [bsz, n_views, ...]; at least 3 dimensions are required")
@@ -327,8 +327,21 @@ def main():
     parser.add_argument("--base-image-dir", type=str, default=None)
 
     parser.add_argument("--model", type=str, default="ViT-B/32", help="Default: smallest ViT CLIP variant")
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", choices=["cuda", "cpu"])
-    parser.add_argument("--amp", action="store_true", help="Enable AMP on CUDA")
+    def _default_device():
+        if torch.cuda.is_available():
+            return "cuda"
+        if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+            return "mps"
+        return "cpu"
+
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        choices=["cuda", "mps", "cpu"],
+        help="Device (default: cuda else mps else cpu). AMP is CUDA-only. ResNet models auto-use CPU when --device mps.",
+    )
+    parser.add_argument("--amp", action="store_true", help="Enable AMP on CUDA only")
 
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--lr", type=float, default=1e-5, help="Backbone finetune LR (start small)")
@@ -356,18 +369,39 @@ def main():
     )
     parser.add_argument("--experiment-name", type=str, default=None)
     parser.add_argument("--save-every", type=int, default=1, help="Save checkpoints every N epochs")
+    parser.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        help="Path to checkpoint to resume from (e.g. .../checkpoints/latest_checkpoint.pt). Uses same out dir and restores epoch, model, optimizer, scaler, and loss history.",
+    )
 
     args = parser.parse_args()
     set_seed(args.seed)
+
+    if args.device is None:
+        args.device = _default_device()
+    if args.device == "mps" and (not getattr(torch.backends, "mps", None) or not torch.backends.mps.is_available()):
+        print("Warning: MPS requested but not available, using CPU.")
+        args.device = "cpu"
+    if args.device == "mps" and args.model.strip().upper().startswith("RN"):
+        print("Warning: ResNet models have MPS compatibility issues. Using CPU.")
+        args.device = "cpu"
 
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested but not available.")
 
-    # output folder
+    # output folder (or infer from --resume)
     out_root = Path(args.output_dir)
     out_root.mkdir(parents=True, exist_ok=True)
-    if args.experiment_name:
+    if args.resume:
+        resume_path = Path(args.resume).resolve()
+        if not resume_path.exists():
+            raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
+        out_dir = resume_path.parent.parent  # .../checkpoints/file.pt -> .../run_dir
+        print(f"Resuming from {resume_path}; output directory: {out_dir}")
+    elif args.experiment_name:
         out_dir = out_root / args.experiment_name
     else:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -422,7 +456,7 @@ def main():
         dataset,
         batch_sampler=sampler,
         num_workers=4,
-        pin_memory=(device.type == "cuda"),
+        pin_memory=(device.type == "cuda"),  # avoid pin_memory with MPS
         collate_fn=collate_views_labels,
     )
 
@@ -440,10 +474,39 @@ def main():
     use_amp = bool(args.amp and device.type == "cuda")
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
+    start_epoch = 1
     losses: List[float] = []
     best_loss = float("inf")
 
-    for epoch in range(1, args.epochs + 1):
+    if args.resume:
+        ckpt_path = Path(args.resume).resolve()
+        ckpt = torch.load(ckpt_path, map_location=device)
+        if "model_state_dict" in ckpt:
+            model.load_state_dict(ckpt["model_state_dict"], strict=True)
+            print(f"Loaded model from {ckpt_path}")
+        if "optimizer_state_dict" in ckpt:
+            try:
+                optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+                print("Loaded optimizer state.")
+            except Exception as e:
+                print(f"Warning: could not load optimizer state: {e}")
+        if use_amp and "scaler_state_dict" in ckpt and ckpt.get("scaler_state_dict") is not None:
+            try:
+                scaler.load_state_dict(ckpt["scaler_state_dict"])
+                print("Loaded AMP scaler state.")
+            except Exception as e:
+                print(f"Warning: could not load scaler state: {e}")
+        start_epoch = int(ckpt.get("epoch", 0)) + 1
+        print(f"Resuming from epoch {start_epoch}")
+        log_file = out_dir / "loss_log.json"
+        if log_file.exists():
+            with open(log_file, "r") as f:
+                log = json.load(f)
+            losses = log.get("losses", [])
+            best_loss = float(log.get("best_loss", float("inf")))
+            print(f"Restored loss history: {len(losses)} epochs, best_loss={best_loss:.4f}")
+
+    for epoch in range(start_epoch, args.epochs + 1):
         model.train()
         running = 0.0
         count = 0

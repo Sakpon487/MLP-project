@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Sequence, Tuple
@@ -261,13 +262,16 @@ def save_checkpoint(
 
     epoch_path = ckpt_dir / f"checkpoint_epoch_{epoch:04d}.pt"
     torch.save(ckpt, epoch_path)
+    print(f"  [save] {epoch_path}")
 
     latest_path = ckpt_dir / "latest_checkpoint.pt"
     torch.save(ckpt, latest_path)
+    print(f"  [save] {latest_path}")
 
     if is_best:
         best_path = ckpt_dir / "best_checkpoint.pt"
         torch.save(ckpt, best_path)
+        print(f"  [save] {best_path} (best so far)")
 
 
 def plot_loss_curve(losses: Sequence[float], save_path: Path, epochs: Sequence[int] | None = None):
@@ -393,17 +397,15 @@ def main():
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested but not available.")
 
-    # output folder (or infer from --resume)
+    # output folder: always from --output-dir and --experiment-name (never from --resume path)
     out_root = Path(args.output_dir)
     out_root.mkdir(parents=True, exist_ok=True)
     if args.resume:
         resume_path = Path(args.resume).resolve()
         if not resume_path.exists():
             raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
-        # Use same run dir so checkpoints and loss_log continue in .../run_dir/checkpoints/
-        out_dir = resume_path.parent.parent  # .../checkpoints/file.pt -> .../run_dir
-        print(f"Resuming from {resume_path}; output directory: {out_dir}")
-    elif args.experiment_name:
+        print(f"Resuming from checkpoint: {resume_path}")
+    if args.experiment_name:
         out_dir = out_root / args.experiment_name
     else:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -411,7 +413,7 @@ def main():
         out_dir = out_root / f"{model_safe}_supcon_backbone_{ts}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Output directory: {out_dir}")
+    print(f"Output directory (all new checkpoints and logs): {out_dir}")
     print(f"Device: {device}")
     print(f"Model: {args.model}")
 
@@ -523,6 +525,7 @@ def main():
             print(f"No loss_log.json found; creating new logs from epoch {start_epoch}")
 
     for epoch in range(start_epoch, args.epochs + 1):
+        epoch_start = time.perf_counter()
         model.train()
         running = 0.0
         count = 0
@@ -570,7 +573,8 @@ def main():
         # write loss log each epoch; epochs_logged are actual epoch numbers (correct when resuming without log)
         best_idx = int(np.argmin(np.array(losses))) if losses else 0
         best_epoch = int(epochs_logged[best_idx]) if losses else epoch
-        with open(out_dir / "loss_log.json", "w") as f:
+        loss_log_path = out_dir / "loss_log.json"
+        with open(loss_log_path, "w") as f:
             json.dump(
                 {
                     "epochs": epochs_logged,
@@ -580,15 +584,17 @@ def main():
                     "batch_size": batch_size,
                     "classes_per_batch": args.classes_per_batch,
                     "samples_per_class": args.samples_per_class,
-                        "contrast_mode": args.contrast_mode,
-                        "temperature": args.temperature,
-                        "base_temperature": base_temp,
+                    "contrast_mode": args.contrast_mode,
+                    "temperature": args.temperature,
+                    "base_temperature": base_temp,
                 },
                 f,
                 indent=2,
             )
+        print(f"  [save] {loss_log_path}")
 
         if epoch % args.save_every == 0 or epoch == args.epochs or is_best:
+            print(f"  Saving checkpoints for epoch {epoch} ...")
             save_checkpoint(
                 out_dir=out_dir,
                 epoch=epoch,
@@ -601,13 +607,17 @@ def main():
                 args_dict=vars(args),
             )
 
-        print(f"Epoch {epoch}: avg_loss={avg_loss:.4f} (best={best_loss:.4f})")
+        epoch_elapsed = time.perf_counter() - epoch_start
+        print(f"Epoch {epoch}: avg_loss={avg_loss:.4f} (best={best_loss:.4f})  time={epoch_elapsed:.1f}s")
 
     # plot (use epochs_logged so x-axis is correct when resuming without log)
-    plot_loss_curve(losses, out_dir / "loss_curve.png", epochs=epochs_logged)
+    loss_curve_path = out_dir / "loss_curve.png"
+    plot_loss_curve(losses, loss_curve_path, epochs=epochs_logged)
+    print(f"[save] {loss_curve_path}")
 
     # save config
-    with open(out_dir / "config.json", "w") as f:
+    config_path = out_dir / "config.json"
+    with open(config_path, "w") as f:
         json.dump(
             {
                 "model": args.model,
@@ -630,6 +640,7 @@ def main():
             f,
             indent=2,
         )
+    print(f"[save] {config_path}")
 
     print("Done.")
     print(f"Best loss: {best_loss:.4f}")

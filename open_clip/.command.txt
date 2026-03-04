@@ -1,0 +1,35 @@
+python3 generate_image_embeddings_backbone_ckpt.py \
+  --dataset-file "/Users/boud/mlpractical/final_project/.data/Ebay_test.txt" \
+  --base-image-dir "/Users/boud/mlpractical/final_project/.data" \
+  --model "ViT-B/32" \
+  --checkpoint "/Users/boud/mlpractical/final_project/open_clip/od_training/simCLR_ft/checkpoints/checkpoint_epoch_0010.pt" \
+  --device mps \
+  --batch-size 128 \
+  --output-dir "./embeddings" \
+  --output-prefix "ViT-B_32_finetuned_simCLR"
+
+
+python3 generate_image_embeddings.py \
+  --dataset-file "/Users/boud/mlpractical/final_project/.data/Ebay_test.txt" \
+  --base-image-dir "/Users/boud/mlpractical/final_project/.data" \
+  --model "ViT-B/32" \
+  --device mps \
+  --batch-size 128 \
+  --output-dir "./embeddings" \
+  --output-prefix "ViT-B_32_baseline"
+
+
+cd /Users/boud/mlpractical/final_project/open_clip
+
+
+python3 train_clip_supcon_backbone.py \
+  --dataset-file "Ebay_train.txt" \
+  --base-image-dir "ดาต้า" \
+  --model "ViT-B/32" \
+  --device mps \
+  --amp \
+  --epochs 20 \
+  --lr 1e-5 \
+  --classes-per-batch 12 \
+  --samples-per-class 20 \
+  --resume "ใส่เช็คพอยต์ของคุณ"

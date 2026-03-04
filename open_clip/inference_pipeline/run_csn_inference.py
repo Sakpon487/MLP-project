@@ -15,6 +15,7 @@ import textwrap
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+from matplotlib.patches import Ellipse
 import numpy as np
 import torch
 from PIL import Image
@@ -44,6 +45,44 @@ def load_array(path: Path) -> np.ndarray:
 def _normalize_embeddings(embeddings: np.ndarray) -> np.ndarray:
     norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
     return embeddings / np.clip(norms, a_min=1e-12, a_max=None)
+
+
+def compute_bits_left_stats(
+    embeddings: np.ndarray,
+    eps_list: tuple[float, ...] = (1e-2, 1e-3, 1e-4),
+) -> dict[str, float | int | dict[str, float | int]]:
+    if embeddings.ndim != 2:
+        raise ValueError("embeddings must be [N, D]")
+
+    abs_emb = np.abs(embeddings)
+    l2_norms = np.linalg.norm(embeddings, axis=1)
+
+    per_sample_active: dict[str, dict[str, float | int]] = {}
+    for eps in eps_list:
+        counts = np.sum(abs_emb > eps, axis=1).astype(np.int64)
+        key = f"eps_{eps:g}"
+        per_sample_active[key] = {
+            "mean": float(np.mean(counts)),
+            "median": float(np.median(counts)),
+            "min": int(np.min(counts)),
+            "max": int(np.max(counts)),
+        }
+
+    dim_std = np.std(embeddings, axis=0)
+    globally_active_dims = int(np.sum(dim_std > 1e-6))
+
+    return {
+        "dim_total": int(embeddings.shape[1]),
+        "embedding_l2_norm": {
+            "mean": float(np.mean(l2_norms)),
+            "std": float(np.std(l2_norms)),
+            "min": float(np.min(l2_norms)),
+            "max": float(np.max(l2_norms)),
+        },
+        "per_sample_active_dims": per_sample_active,
+        "globally_active_dims_std_gt_1e-6": globally_active_dims,
+        "globally_active_frac_std_gt_1e-6": float(globally_active_dims / max(embeddings.shape[1], 1)),
+    }
 
 
 def compute_retrieval_metrics_at_k(
@@ -174,6 +213,8 @@ def plot_tsne(
     tail_mask: np.ndarray | None = None,
     center_labels: np.ndarray | None = None,
     center_label_name: str = "Center IDs",
+    contour_labels: np.ndarray | None = None,
+    contour_label_name: str = "Superclass 90% contours",
     title: str = "t-SNE of Embeddings",
 ) -> None:
     plt.figure(figsize=(10, 8))
@@ -256,6 +297,60 @@ def plot_tsne(
         handles, legend_labels = plt.gca().get_legend_handles_labels()
         if handles:
             plt.legend(loc="best")
+
+    if contour_labels is not None:
+        contour_labels = np.asarray(contour_labels).flatten()
+        if contour_labels.shape[0] != labels.shape[0]:
+            raise ValueError("contour_labels length must match labels length")
+
+        # 90% probability mass for 2D Gaussian => chi-square(df=2, p=0.90) ≈ 4.605
+        chi2_q_90_df2 = 4.605170186
+        contour_classes = np.unique(contour_labels)
+        cmap_contour = plt.cm.get_cmap("tab20", max(int(contour_classes.shape[0]), 1))
+        contour_count = 0
+        first_label = True
+        for i, c in enumerate(contour_classes):
+            idx = np.where(contour_labels == c)[0]
+            if idx.size < 3:
+                continue
+
+            pts = x_2d[idx]
+            mu = pts.mean(axis=0)
+            cov = np.cov(pts.T)
+            if not np.all(np.isfinite(cov)):
+                continue
+
+            eigvals, eigvecs = np.linalg.eigh(cov)
+            eigvals = np.clip(eigvals, a_min=1e-9, a_max=None)
+            order = np.argsort(eigvals)[::-1]
+            eigvals = eigvals[order]
+            eigvecs = eigvecs[:, order]
+
+            width = 2.0 * np.sqrt(chi2_q_90_df2 * eigvals[0])
+            height = 2.0 * np.sqrt(chi2_q_90_df2 * eigvals[1])
+            angle = float(np.degrees(np.arctan2(eigvecs[1, 0], eigvecs[0, 0])))
+
+            ell = Ellipse(
+                xy=(float(mu[0]), float(mu[1])),
+                width=float(width),
+                height=float(height),
+                angle=angle,
+                fill=False,
+                edgecolor=cmap_contour(i),
+                linewidth=1.1,
+                alpha=0.75,
+                label=contour_label_name if first_label else None,
+                zorder=4,
+            )
+            plt.gca().add_patch(ell)
+            first_label = False
+            contour_count += 1
+
+        if contour_count > 0:
+            print(f"Plotted {contour_count} superclass 90% contours.")
+            handles, legend_labels = plt.gca().get_legend_handles_labels()
+            if handles:
+                plt.legend(loc="best")
 
     plt.xlabel("t-SNE 1")
     plt.ylabel("t-SNE 2")
@@ -510,12 +605,20 @@ def evaluate_space(
     image_paths: list[str] | None,
     center_overlay_labels: np.ndarray | None = None,
     center_overlay_name: str = "Centers",
+    contour_overlay_labels: np.ndarray | None = None,
+    contour_overlay_name: str = "Superclass 90% contours",
+    embedding_mode: str = "unknown",
 ) -> None:
     if labels.shape[0] != embeddings.shape[0]:
         raise ValueError(f"Shape mismatch for {tag}: embeddings={embeddings.shape[0]}, labels={labels.shape[0]}")
     if center_overlay_labels is not None and center_overlay_labels.shape[0] != embeddings.shape[0]:
         raise ValueError(
             f"Shape mismatch for {tag}: center overlay labels={center_overlay_labels.shape[0]}, "
+            f"embeddings={embeddings.shape[0]}"
+        )
+    if contour_overlay_labels is not None and contour_overlay_labels.shape[0] != embeddings.shape[0]:
+        raise ValueError(
+            f"Shape mismatch for {tag}: contour overlay labels={contour_overlay_labels.shape[0]}, "
             f"embeddings={embeddings.shape[0]}"
         )
 
@@ -547,12 +650,14 @@ def evaluate_space(
 
     payload = {
         "tag": tag,
+        "embedding_mode": embedding_mode,
         "num_samples": int(embeddings.shape[0]),
         "dim": int(embeddings.shape[1]),
         "rank_k": args.rank_k,
         "recall": {str(k): float(v) for k, v in recall.items()},
         "precision": {str(k): float(v) for k, v in precision.items()},
         "clipped_k": clipped_k,
+        "bits_left": compute_bits_left_stats(embeddings),
     }
     with open(metrics_path, "w") as f:
         json.dump(payload, f, indent=2)
@@ -610,6 +715,13 @@ def evaluate_space(
                 f"[{tag}] Overlaying {np.unique(center_labels_sub).size} {center_overlay_name.lower()} on t-SNE."
             )
 
+        contour_labels_sub = None
+        if contour_overlay_labels is not None:
+            contour_labels_sub = contour_overlay_labels[idx_used]
+            print(
+                f"[{tag}] Overlaying {np.unique(contour_labels_sub).size} {contour_overlay_name.lower()} on t-SNE."
+            )
+
         plot_tsne(
             x_2d,
             y_sub,
@@ -617,6 +729,8 @@ def evaluate_space(
             tail_mask=tail_mask_sub,
             center_labels=center_labels_sub,
             center_label_name=center_overlay_name,
+            contour_labels=contour_labels_sub,
+            contour_label_name=contour_overlay_name,
             title=f"t-SNE ({tag}) tail samples as stars",
         )
     else:
@@ -728,15 +842,17 @@ def main() -> None:
 
         for emb_tag, emb_path in embedding_spaces:
             embeddings = load_array(emb_path).astype(np.float32)
+            embedding_mode = "masked" if emb_tag.endswith("category") else "unmasked"
             for label_tag, labels in label_sets:
                 tag = f"{emb_tag}__eval_{label_tag}"
-                center_overlay_labels = None
-                center_overlay_name = "Centers"
+                center_overlay_labels = category_ids
+                center_overlay_name = "Category Centers"
+                contour_overlay_labels = None
+                contour_overlay_name = "Superclass 90% contours"
 
-                # Overlay category centers on superclass-labeled t-SNE plots.
-                if label_tag == "superclass_ids":
-                    center_overlay_labels = category_ids
-                    center_overlay_name = "Category Centers"
+                # For category-id evaluation views, show superclass mass regions.
+                if label_tag == "category_ids":
+                    contour_overlay_labels = superclass_ids
 
                 evaluate_space(
                     embeddings=embeddings,
@@ -748,6 +864,9 @@ def main() -> None:
                     image_paths=image_paths,
                     center_overlay_labels=center_overlay_labels,
                     center_overlay_name=center_overlay_name,
+                    contour_overlay_labels=contour_overlay_labels,
+                    contour_overlay_name=contour_overlay_name,
+                    embedding_mode=embedding_mode,
                 )
     else:
         embeddings = load_array(args.embeddings.resolve()).astype(np.float32)
@@ -768,6 +887,7 @@ def main() -> None:
             output_dir=args.output_dir,
             tag="single",
             image_paths=image_paths,
+            embedding_mode="unknown",
         )
 
     print("Done")

@@ -712,32 +712,43 @@ def main() -> None:
         elif paths["paths"] is not None and paths["paths"].exists():
             image_paths = [str(x) for x in load_array(paths["paths"]).flatten().tolist()]
 
-        matrix = [
-            ("image_super", paths["image_super"], paths["superclass_ids"]),
-            ("image_category", paths["image_category"], paths["category_ids"]),
-            ("text_super", paths["text_super"], paths["superclass_ids"]),
-            ("text_category", paths["text_category"], paths["category_ids"]),
+        superclass_ids = load_array(paths["superclass_ids"]).astype(np.int64).flatten()
+        category_ids = load_array(paths["category_ids"]).astype(np.int64).flatten()
+
+        embedding_spaces = [
+            ("image_super", paths["image_super"]),
+            ("image_category", paths["image_category"]),
+            ("text_super", paths["text_super"]),
+            ("text_category", paths["text_category"]),
+        ]
+        label_sets = [
+            ("superclass_ids", superclass_ids),
+            ("category_ids", category_ids),
         ]
 
-        for tag, emb_path, lbl_path in matrix:
+        for emb_tag, emb_path in embedding_spaces:
             embeddings = load_array(emb_path).astype(np.float32)
-            labels = load_array(lbl_path).astype(np.int64).flatten()
-            center_overlay_labels = None
-            center_overlay_name = "Centers"
-            if tag in {"image_super", "text_super"}:
-                center_overlay_labels = load_array(paths["category_ids"]).astype(np.int64).flatten()
-                center_overlay_name = "Category Centers"
-            evaluate_space(
-                embeddings=embeddings,
-                labels=labels,
-                args=args,
-                device=device,
-                output_dir=args.output_dir / tag,
-                tag=tag,
-                image_paths=image_paths,
-                center_overlay_labels=center_overlay_labels,
-                center_overlay_name=center_overlay_name,
-            )
+            for label_tag, labels in label_sets:
+                tag = f"{emb_tag}__eval_{label_tag}"
+                center_overlay_labels = None
+                center_overlay_name = "Centers"
+
+                # Overlay category centers on superclass-labeled t-SNE plots.
+                if label_tag == "superclass_ids":
+                    center_overlay_labels = category_ids
+                    center_overlay_name = "Category Centers"
+
+                evaluate_space(
+                    embeddings=embeddings,
+                    labels=labels,
+                    args=args,
+                    device=device,
+                    output_dir=args.output_dir / tag,
+                    tag=tag,
+                    image_paths=image_paths,
+                    center_overlay_labels=center_overlay_labels,
+                    center_overlay_name=center_overlay_name,
+                )
     else:
         embeddings = load_array(args.embeddings.resolve()).astype(np.float32)
         labels = load_array(args.labels.resolve()).astype(np.int64).flatten()

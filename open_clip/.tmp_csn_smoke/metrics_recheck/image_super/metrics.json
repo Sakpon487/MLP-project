@@ -1,0 +1,18 @@
+{
+  "tag": "image_super",
+  "num_samples": 16,
+  "dim": 128,
+  "rank_k": [
+    1,
+    5
+  ],
+  "recall": {
+    "1": 1.0,
+    "5": 1.0
+  },
+  "precision": {
+    "1": 1.0,
+    "5": 1.0
+  },
+  "clipped_k": []
+}

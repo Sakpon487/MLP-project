@@ -1,0 +1,23 @@
+{
+  "tag": "image_category",
+  "embeddings": "/Users/boud/mlpractical/final_project/work_repo/open_clip/.tmp_csn_smoke/emb/smoke_image_category_embeddings.npy",
+  "labels": "/Users/boud/mlpractical/final_project/work_repo/open_clip/.tmp_csn_smoke/emb/smoke_category_ids.npy",
+  "num_samples": 16,
+  "dim": 128,
+  "rank_k": [
+    1,
+    5,
+    10
+  ],
+  "recall": {
+    "1": 0.625,
+    "5": 0.75,
+    "10": 0.875
+  },
+  "precision": {
+    "1": 0.625,
+    "5": 0.3125,
+    "10": 0.16875000298023224
+  },
+  "clipped_k": []
+}

@@ -1,0 +1,51 @@
+{
+  "args": {
+    "csv_file": "/Users/boud/mlpractical/final_project/work_repo/open_clip/.tmp_csn_smoke/tiny.csv",
+    "base_image_dir": "/Users/boud/mlpractical/final_project/.data",
+    "split_dir": "/Users/boud/mlpractical/final_project/work_repo/open_clip/.tmp_csn_smoke/smoke_run/splits",
+    "force_resplit": false,
+    "model": "ViT-B/32",
+    "proj_dim": 128,
+    "hidden_dim": 512,
+    "mask_init": 0.0,
+    "epochs": 1,
+    "batch_size": 4,
+    "lr": 0.001,
+    "weight_decay": 0.0,
+    "temperature": 0.07,
+    "w_super_simclr": 1.0,
+    "w_super_it": 1.0,
+    "w_cat_simclr": 1.0,
+    "w_cat_it": 1.0,
+    "eval_every": 1,
+    "save_every": 1,
+    "num_workers": 0,
+    "device": "cpu",
+    "amp": false,
+    "seed": 0,
+    "resume": null,
+    "output_dir": "/Users/boud/mlpractical/final_project/work_repo/open_clip/.tmp_csn_smoke",
+    "experiment_name": "smoke_run"
+  },
+  "device": "cpu",
+  "amp_enabled": false,
+  "data_stats": {
+    "rows_total": 32,
+    "rows_missing_image": 0,
+    "rows_bad_label": 0,
+    "rows_kept": 32
+  },
+  "split_meta": {
+    "seed": 0,
+    "train_ratio": 0.5,
+    "num_records": 32,
+    "num_train": 16,
+    "num_test": 16,
+    "num_superclasses": 1,
+    "singleton_superclasses": 0,
+    "train_indices_path": "/Users/boud/mlpractical/final_project/work_repo/open_clip/.tmp_csn_smoke/smoke_run/splits/train_indices.npy",
+    "test_indices_path": "/Users/boud/mlpractical/final_project/work_repo/open_clip/.tmp_csn_smoke/smoke_run/splits/test_indices.npy"
+  },
+  "img_embed_dim": 512,
+  "txt_embed_dim": 512
+}

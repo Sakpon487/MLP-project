@@ -1,0 +1,11 @@
+{
+  "seed": 0,
+  "train_ratio": 0.5,
+  "num_records": 32,
+  "num_train": 16,
+  "num_test": 16,
+  "num_superclasses": 1,
+  "singleton_superclasses": 0,
+  "train_indices_path": "/Users/boud/mlpractical/final_project/work_repo/open_clip/.tmp_csn_smoke/smoke_run/splits/train_indices.npy",
+  "test_indices_path": "/Users/boud/mlpractical/final_project/work_repo/open_clip/.tmp_csn_smoke/smoke_run/splits/test_indices.npy"
+}

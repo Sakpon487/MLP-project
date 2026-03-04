@@ -1,0 +1,20 @@
+{
+  "csv_file": "/Users/boud/mlpractical/final_project/work_repo/open_clip/.tmp_csn_smoke/tiny.csv",
+  "split_indices": "/Users/boud/mlpractical/final_project/work_repo/open_clip/.tmp_csn_smoke/smoke_run/splits/test_indices.npy",
+  "checkpoint": "/Users/boud/mlpractical/final_project/work_repo/open_clip/.tmp_csn_smoke/smoke_run/checkpoints/best_checkpoint.pt",
+  "model": "ViT-B/32",
+  "device": "cpu",
+  "normalize": true,
+  "num_samples": 16,
+  "proj_dim": 128,
+  "outputs": {
+    "image_super": "/Users/boud/mlpractical/final_project/work_repo/open_clip/.tmp_csn_smoke/emb/smoke_image_super_embeddings.npy",
+    "image_category": "/Users/boud/mlpractical/final_project/work_repo/open_clip/.tmp_csn_smoke/emb/smoke_image_category_embeddings.npy",
+    "text_super": "/Users/boud/mlpractical/final_project/work_repo/open_clip/.tmp_csn_smoke/emb/smoke_text_super_embeddings.npy",
+    "text_category": "/Users/boud/mlpractical/final_project/work_repo/open_clip/.tmp_csn_smoke/emb/smoke_text_category_embeddings.npy",
+    "superclass_ids": "/Users/boud/mlpractical/final_project/work_repo/open_clip/.tmp_csn_smoke/emb/smoke_superclass_ids.npy",
+    "category_ids": "/Users/boud/mlpractical/final_project/work_repo/open_clip/.tmp_csn_smoke/emb/smoke_category_ids.npy",
+    "paths": "/Users/boud/mlpractical/final_project/work_repo/open_clip/.tmp_csn_smoke/emb/smoke_paths.npy",
+    "metadata": "/Users/boud/mlpractical/final_project/work_repo/open_clip/.tmp_csn_smoke/emb/smoke_metadata.json"
+  }
+}

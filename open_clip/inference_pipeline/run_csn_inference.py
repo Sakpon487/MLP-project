@@ -172,6 +172,8 @@ def plot_tsne(
     labels: np.ndarray,
     out_path: Path,
     tail_mask: np.ndarray | None = None,
+    center_labels: np.ndarray | None = None,
+    center_label_name: str = "Center IDs",
     title: str = "t-SNE of Embeddings",
 ) -> None:
     plt.figure(figsize=(10, 8))
@@ -217,6 +219,43 @@ def plot_tsne(
 
     if scatter_base is not None:
         plt.colorbar(scatter_base, label="Class ID")
+
+    if center_labels is not None:
+        center_labels = np.asarray(center_labels).flatten()
+        if center_labels.shape[0] != labels.shape[0]:
+            raise ValueError("center_labels length must match labels length")
+
+        center_classes = np.unique(center_labels)
+        centers = np.zeros((center_classes.shape[0], 2), dtype=np.float32)
+        for i, c in enumerate(center_classes):
+            idx = np.where(center_labels == c)[0]
+            centers[i] = x_2d[idx].mean(axis=0).astype(np.float32)
+
+        plt.scatter(
+            centers[:, 0],
+            centers[:, 1],
+            s=130,
+            marker="X",
+            c="none",
+            edgecolors="black",
+            linewidths=1.0,
+            label=center_label_name,
+            zorder=5,
+        )
+        for i, c in enumerate(center_classes):
+            plt.annotate(
+                str(int(c)),
+                (centers[i, 0], centers[i, 1]),
+                textcoords="offset points",
+                xytext=(4, 4),
+                fontsize=7,
+                color="black",
+                zorder=6,
+            )
+
+        handles, legend_labels = plt.gca().get_legend_handles_labels()
+        if handles:
+            plt.legend(loc="best")
 
     plt.xlabel("t-SNE 1")
     plt.ylabel("t-SNE 2")
@@ -469,9 +508,16 @@ def evaluate_space(
     output_dir: Path,
     tag: str,
     image_paths: list[str] | None,
+    center_overlay_labels: np.ndarray | None = None,
+    center_overlay_name: str = "Centers",
 ) -> None:
     if labels.shape[0] != embeddings.shape[0]:
         raise ValueError(f"Shape mismatch for {tag}: embeddings={embeddings.shape[0]}, labels={labels.shape[0]}")
+    if center_overlay_labels is not None and center_overlay_labels.shape[0] != embeddings.shape[0]:
+        raise ValueError(
+            f"Shape mismatch for {tag}: center overlay labels={center_overlay_labels.shape[0]}, "
+            f"embeddings={embeddings.shape[0]}"
+        )
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -556,11 +602,21 @@ def evaluate_space(
         )
         tail_mask_sub = np.isin(idx_used, tail_indices_global)
         print(f"[{tag}] t-SNE tail markers: {int(tail_mask_sub.sum())}/{len(idx_used)} points")
+
+        center_labels_sub = None
+        if center_overlay_labels is not None:
+            center_labels_sub = center_overlay_labels[idx_used]
+            print(
+                f"[{tag}] Overlaying {np.unique(center_labels_sub).size} {center_overlay_name.lower()} on t-SNE."
+            )
+
         plot_tsne(
             x_2d,
             y_sub,
             output_dir / "tsne_embeddings.png",
             tail_mask=tail_mask_sub,
+            center_labels=center_labels_sub,
+            center_label_name=center_overlay_name,
             title=f"t-SNE ({tag}) tail samples as stars",
         )
     else:
@@ -666,6 +722,11 @@ def main() -> None:
         for tag, emb_path, lbl_path in matrix:
             embeddings = load_array(emb_path).astype(np.float32)
             labels = load_array(lbl_path).astype(np.int64).flatten()
+            center_overlay_labels = None
+            center_overlay_name = "Centers"
+            if tag in {"image_super", "text_super"}:
+                center_overlay_labels = load_array(paths["category_ids"]).astype(np.int64).flatten()
+                center_overlay_name = "Category Centers"
             evaluate_space(
                 embeddings=embeddings,
                 labels=labels,
@@ -674,6 +735,8 @@ def main() -> None:
                 output_dir=args.output_dir / tag,
                 tag=tag,
                 image_paths=image_paths,
+                center_overlay_labels=center_overlay_labels,
+                center_overlay_name=center_overlay_name,
             )
     else:
         embeddings = load_array(args.embeddings.resolve()).astype(np.float32)

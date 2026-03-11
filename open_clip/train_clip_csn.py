@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Train CLIP-frozen dual-similarity CSN pipeline.
+Train CLIP-frozen visual-only CSN pipeline.
 
 - Superclass similarity on full projection embeddings.
 - Category similarity on shared-mask CSN embeddings.
+- Visual branch only: CLIP image encoder -> projection head -> shared CSN mask.
 """
 
 from __future__ import annotations
@@ -33,7 +34,7 @@ if str(CLIP_DIR) not in sys.path:
 import clip  # type: ignore
 
 from csn_pipeline.data import CSNMultiViewDataset, collate_csn_batch, create_or_load_split, load_csn_records
-from csn_pipeline.losses import ImageTextAgreementLoss, SupConLoss, two_view_supcon_loss
+from csn_pipeline.losses import SupConLoss, two_view_supcon_loss
 from csn_pipeline.model import ProjectionHead, SharedCSNMask
 
 
@@ -41,9 +42,7 @@ from csn_pipeline.model import ProjectionHead, SharedCSNMask
 class LossBundle:
     total: float
     super_simclr: float
-    super_it: float
     cat_simclr: float
-    cat_it: float
 
 
 @dataclass
@@ -97,10 +96,8 @@ def compute_losses(
     model: torch.nn.Module,
     batch: dict[str, torch.Tensor],
     image_head: torch.nn.Module,
-    text_head: torch.nn.Module,
     csn_mask: torch.nn.Module,
     supcon_loss: SupConLoss,
-    it_loss: ImageTextAgreementLoss,
     weights: dict[str, float],
     use_amp: bool,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
@@ -110,57 +107,31 @@ def compute_losses(
         [batch["image_view1"], batch["image_view2"], batch["image_view3"]],
         dim=1,
     ).to(device=device, dtype=torch.float32, non_blocking=True)
-    texts = torch.stack(
-        [batch["text_view1"], batch["text_view2"], batch["text_view3"]],
-        dim=1,
-    ).to(device=device, dtype=torch.long, non_blocking=True)
 
     labels_super = batch["label_view1_2"].to(device=device, non_blocking=True)
     labels_cat = batch["label_view1_3"].to(device=device, non_blocking=True)
 
     bsz, n_views, c, h, w = images.shape
     images_flat = images.view(bsz * n_views, c, h, w)
-    texts_flat = texts.view(bsz * n_views, texts.shape[-1])
 
     with torch.cuda.amp.autocast(enabled=use_amp):
         with torch.no_grad():
             img_feat_flat = model.encode_image(images_flat).float()
-            txt_feat_flat = model.encode_text(texts_flat).float()
 
         img_proj = image_head(img_feat_flat).view(bsz, n_views, -1)
-        txt_proj = text_head(txt_feat_flat).view(bsz, n_views, -1)
-
         img_masked = csn_mask(img_proj.view(bsz * n_views, -1)).view(bsz, n_views, -1)
-        txt_masked = csn_mask(txt_proj.view(bsz * n_views, -1)).view(bsz, n_views, -1)
 
-        l_super_img = two_view_supcon_loss(supcon_loss, img_proj[:, 0], img_proj[:, 1], labels_super)
-        l_super_txt = two_view_supcon_loss(supcon_loss, txt_proj[:, 0], txt_proj[:, 1], labels_super)
-        l_super_simclr = 0.5 * (l_super_img + l_super_txt)
-
-        l_super_it_v1 = it_loss(img_proj[:, 0], txt_proj[:, 0])
-        l_super_it_v2 = it_loss(img_proj[:, 1], txt_proj[:, 1])
-        l_super_it = 0.5 * (l_super_it_v1 + l_super_it_v2)
-
-        l_cat_img = two_view_supcon_loss(supcon_loss, img_masked[:, 0], img_masked[:, 2], labels_cat)
-        l_cat_txt = two_view_supcon_loss(supcon_loss, txt_masked[:, 0], txt_masked[:, 2], labels_cat)
-        l_cat_simclr = 0.5 * (l_cat_img + l_cat_txt)
-
-        l_cat_it_v1 = it_loss(img_masked[:, 0], txt_masked[:, 0])
-        l_cat_it_v3 = it_loss(img_masked[:, 2], txt_masked[:, 2])
-        l_cat_it = 0.5 * (l_cat_it_v1 + l_cat_it_v3)
+        l_super_simclr = two_view_supcon_loss(supcon_loss, img_proj[:, 0], img_proj[:, 1], labels_super)
+        l_cat_simclr = two_view_supcon_loss(supcon_loss, img_masked[:, 0], img_masked[:, 2], labels_cat)
 
         total = (
             weights["w_super_simclr"] * l_super_simclr
-            + weights["w_super_it"] * l_super_it
             + weights["w_cat_simclr"] * l_cat_simclr
-            + weights["w_cat_it"] * l_cat_it
         )
 
     parts = {
         "super_simclr": l_super_simclr,
-        "super_it": l_super_it,
         "cat_simclr": l_cat_simclr,
-        "cat_it": l_cat_it,
     }
     return total, parts
 
@@ -169,10 +140,8 @@ def run_epoch(
     loader: DataLoader,
     model: torch.nn.Module,
     image_head: torch.nn.Module,
-    text_head: torch.nn.Module,
     csn_mask: torch.nn.Module,
     supcon_loss: SupConLoss,
-    it_loss: ImageTextAgreementLoss,
     weights: dict[str, float],
     optimizer: torch.optim.Optimizer | None,
     scaler: torch.cuda.amp.GradScaler,
@@ -183,21 +152,17 @@ def run_epoch(
 ) -> LossBundle:
     if train:
         image_head.train()
-        text_head.train()
         csn_mask.train()
         mode = f"Train {epoch}/{total_epochs}"
     else:
         image_head.eval()
-        text_head.eval()
         csn_mask.eval()
         mode = f"Test {epoch}/{total_epochs}"
 
     running = {
         "total": 0.0,
         "super_simclr": 0.0,
-        "super_it": 0.0,
         "cat_simclr": 0.0,
-        "cat_it": 0.0,
     }
     n_batches = 0
 
@@ -213,10 +178,8 @@ def run_epoch(
                 model=model,
                 batch=batch,
                 image_head=image_head,
-                text_head=text_head,
                 csn_mask=csn_mask,
                 supcon_loss=supcon_loss,
-                it_loss=it_loss,
                 weights=weights,
                 use_amp=use_amp,
             )
@@ -231,7 +194,7 @@ def run_epoch(
                     optimizer.step()
 
         running["total"] += float(total.item())
-        for k in ("super_simclr", "super_it", "cat_simclr", "cat_it"):
+        for k in ("super_simclr", "cat_simclr"):
             running[k] += float(parts[k].item())
         n_batches += 1
 
@@ -243,9 +206,7 @@ def run_epoch(
     return LossBundle(
         total=running["total"] / n_batches,
         super_simclr=running["super_simclr"] / n_batches,
-        super_it=running["super_it"] / n_batches,
         cat_simclr=running["cat_simclr"] / n_batches,
-        cat_it=running["cat_it"] / n_batches,
     )
 
 
@@ -254,7 +215,6 @@ def save_checkpoint(
     epoch: int,
     args: argparse.Namespace,
     image_head: ProjectionHead,
-    text_head: ProjectionHead,
     csn_mask: SharedCSNMask,
     optimizer: torch.optim.Optimizer,
     scaler: torch.cuda.amp.GradScaler | None,
@@ -267,8 +227,8 @@ def save_checkpoint(
     ckpt = {
         "epoch": int(epoch),
         "model_name": args.model,
+        "visual_only": True,
         "image_head_state_dict": image_head.state_dict(),
-        "text_head_state_dict": text_head.state_dict(),
         "csn_mask_state_dict": csn_mask.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "scaler_state_dict": scaler.state_dict() if scaler is not None else None,
@@ -334,7 +294,7 @@ def plot_loss_curves(out_dir: Path, train_history: list[dict[str, Any]], test_hi
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train frozen-CLIP CSN dual-similarity pipeline")
+    parser = argparse.ArgumentParser(description="Train frozen-CLIP visual-only CSN pipeline")
 
     parser.add_argument("--csv-file", type=str, required=True)
     parser.add_argument("--base-image-dir", type=str, default=None)
@@ -350,6 +310,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=0.0)
+    parser.add_argument(
+        "--linear-weight-decay",
+        type=float,
+        default=1e-4,
+        help="Weight decay for projection linear layers (image_head). Mask uses --weight-decay.",
+    )
     parser.add_argument("--temperature", type=float, default=0.07)
 
     parser.add_argument("--w-super-simclr", type=float, default=1.0)
@@ -413,13 +379,13 @@ def main() -> None:
 
     with torch.no_grad():
         dummy_img = preprocess(Image.new("RGB", (224, 224))).unsqueeze(0).to(device=device, dtype=torch.float32)
-        dummy_txt = clip.tokenize(["a photo"]).to(device)
         img_dim = int(model.encode_image(dummy_img).shape[-1])
-        txt_dim = int(model.encode_text(dummy_txt).shape[-1])
 
     image_head = ProjectionHead(img_dim, args.hidden_dim, args.proj_dim).to(device).float()
-    text_head = ProjectionHead(txt_dim, args.hidden_dim, args.proj_dim).to(device).float()
     csn_mask = SharedCSNMask(args.proj_dim, mask_init=args.mask_init).to(device).float()
+
+    if args.w_super_it != 0.0 or args.w_cat_it != 0.0:
+        print("Note: --w-super-it and --w-cat-it are ignored in visual-only mode.")
 
     tokenizer = lambda texts: clip.tokenize(texts, truncate=True)
 
@@ -461,17 +427,19 @@ def main() -> None:
     )
 
     supcon_loss = SupConLoss(temperature=args.temperature).to(device)
-    it_loss = ImageTextAgreementLoss(temperature=args.temperature).to(device)
 
-    optim_params = list(image_head.parameters()) + list(text_head.parameters()) + list(csn_mask.parameters())
-    optimizer = torch.optim.AdamW(optim_params, lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": list(image_head.parameters()), "weight_decay": float(args.linear_weight_decay)},
+            {"params": list(csn_mask.parameters()), "weight_decay": float(args.weight_decay)},
+        ],
+        lr=args.lr,
+    )
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     weights = {
         "w_super_simclr": float(args.w_super_simclr),
-        "w_super_it": float(args.w_super_it),
         "w_cat_simclr": float(args.w_cat_simclr),
-        "w_cat_it": float(args.w_cat_it),
     }
 
     state = TrainState(epoch=0, best_metric=float("inf"), best_epoch=0, train_history=[], test_history=[])
@@ -483,7 +451,6 @@ def main() -> None:
             raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
         ckpt = torch.load(resume_path, map_location=device)
         image_head.load_state_dict(ckpt["image_head_state_dict"], strict=True)
-        text_head.load_state_dict(ckpt["text_head_state_dict"], strict=True)
         csn_mask.load_state_dict(ckpt["csn_mask_state_dict"], strict=True)
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         if use_amp and ckpt.get("scaler_state_dict") is not None:
@@ -508,7 +475,11 @@ def main() -> None:
         "data_stats": data_stats,
         "split_meta": split_meta,
         "img_embed_dim": img_dim,
-        "txt_embed_dim": txt_dim,
+        "visual_only": True,
+        "ignored_weights": {
+            "w_super_it": float(args.w_super_it),
+            "w_cat_it": float(args.w_cat_it),
+        },
     }
     with open(exp_dir / "config.json", "w") as f:
         json.dump(config, f, indent=2)
@@ -519,10 +490,8 @@ def main() -> None:
             loader=train_loader,
             model=model,
             image_head=image_head,
-            text_head=text_head,
             csn_mask=csn_mask,
             supcon_loss=supcon_loss,
-            it_loss=it_loss,
             weights=weights,
             optimizer=optimizer,
             scaler=scaler,
@@ -542,10 +511,8 @@ def main() -> None:
                 loader=test_loader,
                 model=model,
                 image_head=image_head,
-                text_head=text_head,
                 csn_mask=csn_mask,
                 supcon_loss=supcon_loss,
-                it_loss=it_loss,
                 weights=weights,
                 optimizer=None,
                 scaler=scaler,
@@ -571,7 +538,6 @@ def main() -> None:
                 epoch=epoch,
                 args=args,
                 image_head=image_head,
-                text_head=text_head,
                 csn_mask=csn_mask,
                 optimizer=optimizer,
                 scaler=scaler if use_amp else None,

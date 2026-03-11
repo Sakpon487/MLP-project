@@ -10,6 +10,7 @@ Train CLIP-frozen visual-only CSN pipeline.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import random
 import sys
@@ -23,7 +24,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from PIL import Image
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 # local CLIP checkout
@@ -33,7 +34,7 @@ if str(CLIP_DIR) not in sys.path:
 
 import clip  # type: ignore
 
-from csn_pipeline.data import CSNMultiViewDataset, collate_csn_batch, create_or_load_split, load_csn_records
+from csn_pipeline.data import create_or_load_split, load_csn_records
 from csn_pipeline.losses import SupConLoss, two_view_supcon_loss
 from csn_pipeline.model import ProjectionHead, SharedCSNMask
 
@@ -52,6 +53,62 @@ class TrainState:
     best_epoch: int
     train_history: list[dict[str, Any]]
     test_history: list[dict[str, Any]]
+
+
+class CSNIndexMultiViewDataset(Dataset):
+    """Multi-view dataset returning global record indices for (anchor, super+, cat+)."""
+
+    def __init__(self, records, indices: np.ndarray, seed: int = 0):
+        self.records = records
+        self.indices = np.asarray(indices, dtype=np.int64)
+        self.rng = random.Random(seed)
+
+        self.super_to_local: dict[int, list[int]] = {}
+        self.cat_to_local: dict[int, list[int]] = {}
+        for local_pos, global_idx in enumerate(self.indices.tolist()):
+            rec = self.records[int(global_idx)]
+            self.super_to_local.setdefault(int(rec.superclass_id), []).append(local_pos)
+            self.cat_to_local.setdefault(int(rec.category_id), []).append(local_pos)
+
+    def __len__(self) -> int:
+        return int(self.indices.shape[0])
+
+    def _sample_positive_local(self, pool: list[int], anchor_local: int) -> int:
+        candidates = [i for i in pool if i != anchor_local]
+        if not candidates:
+            return anchor_local
+        return self.rng.choice(candidates)
+
+    def __getitem__(self, local_idx: int) -> dict[str, int]:
+        anchor_global = int(self.indices[local_idx])
+        anchor = self.records[anchor_global]
+
+        super_pool = self.super_to_local[int(anchor.superclass_id)]
+        cat_pool = self.cat_to_local[int(anchor.category_id)]
+
+        pos_super_local = self._sample_positive_local(super_pool, int(local_idx))
+        pos_cat_local = self._sample_positive_local(cat_pool, int(local_idx))
+
+        super_global = int(self.indices[pos_super_local])
+        cat_global = int(self.indices[pos_cat_local])
+
+        return {
+            "idx_view1": anchor_global,
+            "idx_view2": super_global,
+            "idx_view3": cat_global,
+            "label_view1_2": int(anchor.superclass_id),
+            "label_view1_3": int(anchor.category_id),
+        }
+
+
+def collate_csn_index_batch(batch: list[dict[str, int]]) -> dict[str, torch.Tensor]:
+    return {
+        "idx_view1": torch.tensor([b["idx_view1"] for b in batch], dtype=torch.long),
+        "idx_view2": torch.tensor([b["idx_view2"] for b in batch], dtype=torch.long),
+        "idx_view3": torch.tensor([b["idx_view3"] for b in batch], dtype=torch.long),
+        "label_view1_2": torch.tensor([b["label_view1_2"] for b in batch], dtype=torch.long),
+        "label_view1_3": torch.tensor([b["label_view1_3"] for b in batch], dtype=torch.long),
+    }
 
 
 def set_seed(seed: int) -> None:
@@ -92,8 +149,83 @@ def freeze_clip_model(model: torch.nn.Module) -> None:
     model.eval()
 
 
-def compute_losses(
+def _records_path_hash(records) -> str:
+    h = hashlib.sha1()
+    for rec in records:
+        h.update(str(rec.image_path).encode("utf-8"))
+        h.update(b"\n")
+    return h.hexdigest()
+
+
+def load_or_build_clip_image_cache(
     model: torch.nn.Module,
+    preprocess,
+    records,
+    model_name: str,
+    cache_path: Path,
+    device: torch.device,
+    batch_size: int,
+) -> torch.Tensor:
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    meta_path = cache_path.with_suffix(".meta.json")
+
+    expected = {
+        "model": str(model_name),
+        "num_records": int(len(records)),
+        "records_path_hash": _records_path_hash(records),
+    }
+
+    if cache_path.exists() and meta_path.exists():
+        try:
+            with open(meta_path, "r") as f:
+                meta = json.load(f)
+            arr = np.load(cache_path)
+            if (
+                arr.ndim == 2
+                and int(arr.shape[0]) == expected["num_records"]
+                and str(meta.get("model")) == expected["model"]
+                and str(meta.get("records_path_hash")) == expected["records_path_hash"]
+            ):
+                print(f"Loaded CLIP image cache: {cache_path}  shape={arr.shape}")
+                return torch.from_numpy(np.asarray(arr, dtype=np.float32))
+            print("CLIP image cache metadata mismatch; rebuilding cache.")
+        except Exception as e:
+            print(f"Failed to load CLIP image cache ({e}); rebuilding cache.")
+
+    print(f"Building CLIP image cache for {len(records)} records...")
+    feats_cpu: list[torch.Tensor] = []
+
+    with torch.no_grad():
+        for i in tqdm(range(0, len(records), batch_size), desc="CLIP image cache"):
+            batch_records = records[i : i + batch_size]
+            imgs = []
+            for rec in batch_records:
+                try:
+                    img = Image.open(rec.image_path).convert("RGB")
+                except Exception:
+                    img = Image.new("RGB", (224, 224), color="black")
+                imgs.append(preprocess(img))
+
+            x = torch.stack(imgs, dim=0).to(device=device, dtype=torch.float32)
+            f = model.encode_image(x).float().cpu()
+            feats_cpu.append(f)
+
+    features = torch.cat(feats_cpu, dim=0).contiguous()
+    np.save(cache_path, features.numpy())
+
+    meta = {
+        **expected,
+        "feature_dim": int(features.shape[1]),
+    }
+    with open(meta_path, "w") as f:
+        json.dump(meta, f, indent=2)
+
+    print(f"Saved CLIP image cache: {cache_path}  shape={tuple(features.shape)}")
+    return features
+
+
+def compute_losses(
+    clip_feature_cache: torch.Tensor,
     batch: dict[str, torch.Tensor],
     image_head: torch.nn.Module,
     csn_mask: torch.nn.Module,
@@ -103,20 +235,18 @@ def compute_losses(
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     device = next(image_head.parameters()).device
 
-    images = torch.stack(
-        [batch["image_view1"], batch["image_view2"], batch["image_view3"]],
+    idx_views = torch.stack(
+        [batch["idx_view1"], batch["idx_view2"], batch["idx_view3"]],
         dim=1,
-    ).to(device=device, dtype=torch.float32, non_blocking=True)
-
+    )
     labels_super = batch["label_view1_2"].to(device=device, non_blocking=True)
     labels_cat = batch["label_view1_3"].to(device=device, non_blocking=True)
 
-    bsz, n_views, c, h, w = images.shape
-    images_flat = images.view(bsz * n_views, c, h, w)
+    bsz, n_views = idx_views.shape
+    idx_flat = idx_views.view(-1).cpu()
 
     with torch.cuda.amp.autocast(enabled=use_amp):
-        with torch.no_grad():
-            img_feat_flat = model.encode_image(images_flat).float()
+        img_feat_flat = clip_feature_cache.index_select(0, idx_flat).to(device=device, dtype=torch.float32, non_blocking=True)
 
         img_proj = image_head(img_feat_flat).view(bsz, n_views, -1)
         img_masked = csn_mask(img_proj.view(bsz * n_views, -1)).view(bsz, n_views, -1)
@@ -138,7 +268,7 @@ def compute_losses(
 
 def run_epoch(
     loader: DataLoader,
-    model: torch.nn.Module,
+    clip_feature_cache: torch.Tensor,
     image_head: torch.nn.Module,
     csn_mask: torch.nn.Module,
     supcon_loss: SupConLoss,
@@ -175,7 +305,7 @@ def run_epoch(
         ctx = torch.enable_grad() if train else torch.no_grad()
         with ctx:
             total, parts = compute_losses(
-                model=model,
+                clip_feature_cache=clip_feature_cache,
                 batch=batch,
                 image_head=image_head,
                 csn_mask=csn_mask,
@@ -372,14 +502,33 @@ def main() -> None:
     )
     print(f"Loaded records: {len(records)}  train={len(train_idx)} test={len(test_idx)}")
 
-    # model
+    # model and CLIP cache
     model, preprocess = clip.load(args.model, device=device, jit=False)
     model = model.float()
     freeze_clip_model(model)
 
-    with torch.no_grad():
-        dummy_img = preprocess(Image.new("RGB", (224, 224))).unsqueeze(0).to(device=device, dtype=torch.float32)
-        img_dim = int(model.encode_image(dummy_img).shape[-1])
+    model_safe = args.model.replace("/", "_").replace("@", "_")
+    split_dir_path = Path(args.split_dir)
+    cache_path = split_dir_path / f"{model_safe}_clip_image_features.npy"
+
+    clip_feature_cache = load_or_build_clip_image_cache(
+        model=model,
+        preprocess=preprocess,
+        records=records,
+        model_name=args.model,
+        cache_path=cache_path,
+        device=device,
+        batch_size=max(int(args.batch_size), 64),
+    )
+
+    img_dim = int(clip_feature_cache.shape[1])
+    if device.type == "cuda":
+        clip_feature_cache = clip_feature_cache.pin_memory()
+
+    # CLIP model no longer needed after feature cache is ready
+    del model
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
 
     image_head = ProjectionHead(img_dim, args.hidden_dim, args.proj_dim).to(device).float()
     csn_mask = SharedCSNMask(args.proj_dim, mask_init=args.mask_init).to(device).float()
@@ -387,22 +536,8 @@ def main() -> None:
     if args.w_super_it != 0.0 or args.w_cat_it != 0.0:
         print("Note: --w-super-it and --w-cat-it are ignored in visual-only mode.")
 
-    tokenizer = lambda texts: clip.tokenize(texts, truncate=True)
-
-    train_ds = CSNMultiViewDataset(
-        records=records,
-        indices=train_idx,
-        image_transform=preprocess,
-        text_tokenize_fn=tokenizer,
-        seed=args.seed,
-    )
-    test_ds = CSNMultiViewDataset(
-        records=records,
-        indices=test_idx,
-        image_transform=preprocess,
-        text_tokenize_fn=tokenizer,
-        seed=args.seed + 1,
-    )
+    train_ds = CSNIndexMultiViewDataset(records=records, indices=train_idx, seed=args.seed)
+    test_ds = CSNIndexMultiViewDataset(records=records, indices=test_idx, seed=args.seed + 1)
 
     pin_memory = device.type == "cuda"
     generator = torch.Generator()
@@ -414,7 +549,7 @@ def main() -> None:
         shuffle=True,
         num_workers=args.num_workers,
         pin_memory=pin_memory,
-        collate_fn=collate_csn_batch,
+        collate_fn=collate_csn_index_batch,
         generator=generator,
     )
     test_loader = DataLoader(
@@ -423,7 +558,7 @@ def main() -> None:
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=pin_memory,
-        collate_fn=collate_csn_batch,
+        collate_fn=collate_csn_index_batch,
     )
 
     supcon_loss = SupConLoss(temperature=args.temperature).to(device)
@@ -452,9 +587,15 @@ def main() -> None:
         ckpt = torch.load(resume_path, map_location=device)
         image_head.load_state_dict(ckpt["image_head_state_dict"], strict=True)
         csn_mask.load_state_dict(ckpt["csn_mask_state_dict"], strict=True)
-        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        try:
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        except Exception as e:
+            print(f"Warning: could not load optimizer state from resume checkpoint ({e}); continuing with fresh optimizer.")
         if use_amp and ckpt.get("scaler_state_dict") is not None:
-            scaler.load_state_dict(ckpt["scaler_state_dict"])
+            try:
+                scaler.load_state_dict(ckpt["scaler_state_dict"])
+            except Exception as e:
+                print(f"Warning: could not load AMP scaler state ({e}); continuing with fresh scaler.")
 
         ts_data = ckpt.get("train_state", {})
         state = TrainState(
@@ -476,6 +617,7 @@ def main() -> None:
         "split_meta": split_meta,
         "img_embed_dim": img_dim,
         "visual_only": True,
+        "clip_image_cache_path": str(cache_path),
         "ignored_weights": {
             "w_super_it": float(args.w_super_it),
             "w_cat_it": float(args.w_cat_it),
@@ -488,7 +630,7 @@ def main() -> None:
         t0 = time.perf_counter()
         train_loss = run_epoch(
             loader=train_loader,
-            model=model,
+            clip_feature_cache=clip_feature_cache,
             image_head=image_head,
             csn_mask=csn_mask,
             supcon_loss=supcon_loss,
@@ -509,7 +651,7 @@ def main() -> None:
         if do_eval:
             test_loss = run_epoch(
                 loader=test_loader,
-                model=model,
+                clip_feature_cache=clip_feature_cache,
                 image_head=image_head,
                 csn_mask=csn_mask,
                 supcon_loss=supcon_loss,

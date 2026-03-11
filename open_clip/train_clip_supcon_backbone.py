@@ -156,24 +156,75 @@ def load_sop_samples(dataset_file: str | Path, base_image_dir: str | Path | None
     return samples
 
 
-def load_csn_train_samples(
+def load_csn_split_samples(
     csv_file: str | Path,
     base_image_dir: str | Path | None,
     split_dir: str | Path,
     seed: int,
     force_resplit: bool,
     train_ratio: float = 0.5,
-) -> tuple[list[tuple[str, int]], dict[str, Any], dict[str, Any]]:
+) -> tuple[list[tuple[str, int]], list[tuple[str, int]], dict[str, Any], dict[str, Any]]:
     records, data_stats = load_csn_records(csv_file, base_image_dir)
-    train_idx, _test_idx, split_meta = create_or_load_split(
+    train_idx, test_idx, split_meta = create_or_load_split(
         records=records,
         split_dir=split_dir,
         seed=seed,
         force_resplit=force_resplit,
         train_ratio=train_ratio,
     )
-    samples = [(records[int(i)].image_path, int(records[int(i)].superclass_id)) for i in train_idx.tolist()]
-    return samples, data_stats, split_meta
+    train_samples = [(records[int(i)].image_path, int(records[int(i)].superclass_id)) for i in train_idx.tolist()]
+    test_samples = [(records[int(i)].image_path, int(records[int(i)].superclass_id)) for i in test_idx.tolist()]
+    return train_samples, test_samples, data_stats, split_meta
+
+
+def split_samples_by_superclass(
+    samples: list[tuple[str, int]],
+    seed: int,
+    train_ratio: float = 0.5,
+) -> tuple[list[tuple[str, int]], list[tuple[str, int]], dict[str, Any]]:
+    if not (0.0 < train_ratio < 1.0):
+        raise ValueError("train_ratio must be in (0,1)")
+
+    by_super: dict[int, list[int]] = {}
+    for idx, (_, super_id) in enumerate(samples):
+        by_super.setdefault(int(super_id), []).append(idx)
+
+    rng = random.Random(seed)
+    train_idx: list[int] = []
+    test_idx: list[int] = []
+    singleton_supers = 0
+
+    for super_id, idxs in sorted(by_super.items(), key=lambda x: x[0]):
+        idxs_local = list(idxs)
+        rng.shuffle(idxs_local)
+
+        if len(idxs_local) == 1:
+            train_idx.extend(idxs_local)
+            singleton_supers += 1
+            continue
+
+        n_train = int(round(len(idxs_local) * train_ratio))
+        n_train = max(1, min(len(idxs_local) - 1, n_train))
+        train_idx.extend(idxs_local[:n_train])
+        test_idx.extend(idxs_local[n_train:])
+
+    if not train_idx or not test_idx:
+        raise ValueError(
+            f"Empty split generated (train={len(train_idx)}, test={len(test_idx)}). Check dataset distribution."
+        )
+
+    train_samples = [samples[i] for i in sorted(train_idx)]
+    test_samples = [samples[i] for i in sorted(test_idx)]
+    split_meta: dict[str, Any] = {
+        "seed": int(seed),
+        "train_ratio": float(train_ratio),
+        "num_records": int(len(samples)),
+        "num_train": int(len(train_samples)),
+        "num_test": int(len(test_samples)),
+        "num_superclasses": int(len(by_super)),
+        "singleton_superclasses": int(singleton_supers),
+    }
+    return train_samples, test_samples, split_meta
 
 
 # ---- loss ----
@@ -307,16 +358,27 @@ def save_checkpoint(
         print(f"  [save] {best_path} (best so far)")
 
 
-def plot_loss_curve(losses: Sequence[float], save_path: Path, epochs: Sequence[int] | None = None):
+def plot_loss_curve(
+    train_losses: Sequence[float],
+    save_path: Path,
+    train_epochs: Sequence[int] | None = None,
+    test_losses: Sequence[float] | None = None,
+    test_epochs: Sequence[int] | None = None,
+):
     import matplotlib.pyplot as plt
 
     plt.figure(figsize=(10, 6))
-    x = epochs if epochs is not None and len(epochs) == len(losses) else list(range(1, len(losses) + 1))
-    plt.plot(x, losses, linewidth=2)
+    x_train = train_epochs if train_epochs is not None and len(train_epochs) == len(train_losses) else list(range(1, len(train_losses) + 1))
+    plt.plot(x_train, train_losses, linewidth=2, label="train_loss")
+    if test_losses:
+        x_test = test_epochs if test_epochs is not None and len(test_epochs) == len(test_losses) else list(range(1, len(test_losses) + 1))
+        plt.plot(x_test, test_losses, linewidth=2, label="test_loss")
     plt.xlabel("Epoch")
     plt.ylabel("Loss")
-    plt.title("SupCon Training Loss")
+    plt.title("SupCon training/test loss")
     plt.grid(True, alpha=0.3)
+    if test_losses:
+        plt.legend()
     plt.tight_layout()
     plt.savefig(save_path, dpi=150)
     plt.close()
@@ -357,6 +419,73 @@ def build_train_transform(preprocess, image_size: int):
             norm,
         ]
     )
+
+
+def run_epoch(
+    loader: DataLoader,
+    model: torch.nn.Module,
+    loss_fn: SupConLoss,
+    optimizer: torch.optim.Optimizer | None,
+    scaler: torch.cuda.amp.GradScaler,
+    use_amp: bool,
+    grad_clip_norm: float | None,
+    optim_params: list[torch.nn.Parameter],
+    device: torch.device,
+    train: bool,
+    epoch: int,
+    total_epochs: int,
+) -> float:
+    if train:
+        model.train()
+        mode = f"Train {epoch}/{total_epochs}"
+    else:
+        model.eval()
+        mode = f"Test {epoch}/{total_epochs}"
+
+    running = 0.0
+    count = 0
+    pbar = tqdm(loader, desc=mode, total=len(loader))
+    for images, labels in pbar:
+        images = images.to(device=device, dtype=torch.float32, non_blocking=True)
+        labels = labels.to(device=device, non_blocking=True)
+
+        if train:
+            assert optimizer is not None
+            optimizer.zero_grad(set_to_none=True)
+
+        ctx = torch.enable_grad() if train else torch.no_grad()
+        with ctx:
+            with torch.cuda.amp.autocast(enabled=use_amp):
+                # images: [bsz, 2, C, H, W] -> flatten views for encoding
+                bsz, n_views, c, h, w = images.shape
+                x = images.view(bsz * n_views, c, h, w)
+                feats_flat = model.encode_image(x).float()
+                feats_flat = F.normalize(feats_flat, dim=-1)
+                feats = feats_flat.view(bsz, n_views, -1)  # [bsz, 2, dim]
+                loss = loss_fn(feats, labels=labels)
+
+            if train:
+                if use_amp:
+                    scaler.scale(loss).backward()
+                    if grad_clip_norm is not None:
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(optim_params, grad_clip_norm)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    if grad_clip_norm is not None:
+                        torch.nn.utils.clip_grad_norm_(optim_params, grad_clip_norm)
+                    optimizer.step()
+
+        running += float(loss.item())
+        count += 1
+        pbar.set_postfix(total=f"{running/max(1,count):.4f}")
+
+    if count == 0:
+        raise RuntimeError("No batches processed in epoch.")
+
+    return running / count
 
 
 def main():
@@ -410,6 +539,7 @@ def main():
     )
     parser.add_argument("--experiment-name", type=str, default=None)
     parser.add_argument("--save-every", type=int, default=1, help="Save checkpoints every N epochs")
+    parser.add_argument("--eval-every", type=int, default=1, help="Run validation every N epochs")
     parser.add_argument(
         "--resume",
         type=str,
@@ -487,7 +617,7 @@ def main():
     train_transform = build_train_transform(preprocess, int(image_size))
 
     if args.csv_file is not None:
-        samples, data_stats, split_meta = load_csn_train_samples(
+        train_samples, test_samples, data_stats, split_meta = load_csn_split_samples(
             csv_file=args.csv_file,
             base_image_dir=args.base_image_dir,
             split_dir=args.split_dir,
@@ -495,28 +625,49 @@ def main():
             force_resplit=args.force_resplit,
             train_ratio=0.5,
         )
-        print(f"Loaded CSV records for train split: {len(samples)} samples")
+        print(f"Loaded CSV records: train={len(train_samples)} test={len(test_samples)}")
     else:
         samples = load_sop_samples(args.dataset_file, args.base_image_dir)
-        print(f"Loaded SOP samples: {len(samples)}")
+        train_samples, test_samples, split_meta = split_samples_by_superclass(samples, seed=args.seed, train_ratio=0.5)
+        print(f"Loaded SOP samples: total={len(samples)} train={len(train_samples)} test={len(test_samples)}")
 
-    dataset = SuperClassDataset(samples=samples, transform=train_transform)
-    if len(dataset) == 0:
+    train_dataset = SuperClassDataset(samples=train_samples, transform=train_transform)
+    test_dataset = SuperClassDataset(samples=test_samples, transform=train_transform)
+    if len(train_dataset) == 0:
         raise ValueError("Dataset contains 0 valid images. Check paths/base-image-dir.")
+    if len(test_dataset) == 0:
+        raise ValueError("Validation split contains 0 valid images. Check dataset/split settings.")
 
     batch_size = args.classes_per_batch * args.samples_per_class
-    steps_per_epoch = args.steps_per_epoch or max(1, len(dataset) // batch_size)
-    sampler = PKBatchSampler(
-        dataset.class_to_indices,
+    steps_per_epoch = args.steps_per_epoch or max(1, len(train_dataset) // batch_size)
+    train_sampler = PKBatchSampler(
+        train_dataset.class_to_indices,
         classes_per_batch=args.classes_per_batch,
         samples_per_class=args.samples_per_class,
         steps_per_epoch=steps_per_epoch,
         seed=args.seed,
     )
+    test_classes_per_batch = min(args.classes_per_batch, len(test_dataset.class_to_indices))
+    test_batch_size = test_classes_per_batch * args.samples_per_class
+    test_steps_per_epoch = max(1, len(test_dataset) // max(1, test_batch_size))
+    test_sampler = PKBatchSampler(
+        test_dataset.class_to_indices,
+        classes_per_batch=test_classes_per_batch,
+        samples_per_class=args.samples_per_class,
+        steps_per_epoch=test_steps_per_epoch,
+        seed=args.seed + 1,
+    )
 
-    loader = DataLoader(
-        dataset,
-        batch_sampler=sampler,
+    train_loader = DataLoader(
+        train_dataset,
+        batch_sampler=train_sampler,
+        num_workers=4,
+        pin_memory=(device.type == "cuda"),  # avoid pin_memory with MPS
+        collate_fn=collate_views_labels,
+    )
+    test_loader = DataLoader(
+        test_dataset,
+        batch_sampler=test_sampler,
         num_workers=4,
         pin_memory=(device.type == "cuda"),  # avoid pin_memory with MPS
         collate_fn=collate_views_labels,
@@ -537,9 +688,14 @@ def main():
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     start_epoch = 1
-    losses: List[float] = []
-    epochs_logged: List[int] = []  # actual epoch number for each loss (so logs are correct when resuming without log file)
-    best_loss = float("inf")
+    train_losses: List[float] = []
+    train_epochs: List[int] = []
+    test_losses: List[float] = []
+    test_epochs: List[int] = []
+    train_history: list[dict[str, Any]] = []
+    test_history: list[dict[str, Any]] = []
+    best_metric = float("inf")
+    best_epoch = 0
 
     if args.resume:
         ckpt_path = Path(args.resume).resolve()
@@ -561,90 +717,112 @@ def main():
                 print(f"Warning: could not load scaler state: {e}")
         start_epoch = int(ckpt.get("epoch", 0)) + 1
         print(f"Resuming from epoch {start_epoch}")
-        # Optional: restore loss history so curve and best_loss continue. If no log file, we start fresh from here.
+        # Optional: restore loss history so curve and best metric continue.
         log_file = out_dir / "loss_log.json"
         if log_file.exists():
             try:
                 with open(log_file, "r") as f:
                     log = json.load(f)
-                losses = log.get("losses", [])
-                best_loss = float(log.get("best_loss", float("inf")))
-                # epochs_logged: use saved list or infer 1..len(losses) for backward compatibility
-                epochs_logged = log.get("epochs", list(range(1, len(losses) + 1)) if losses else [])
-                if len(epochs_logged) != len(losses):
-                    epochs_logged = list(range(1, len(losses) + 1)) if losses else []
-                print(f"Restored loss history: {len(losses)} epochs, best_loss={best_loss:.4f}")
+                train_history = list(log.get("train_history", []))
+                test_history = list(log.get("test_history", []))
+                train_epochs = [int(x["epoch"]) for x in train_history if "epoch" in x and "loss" in x]
+                train_losses = [float(x["loss"]) for x in train_history if "epoch" in x and "loss" in x]
+                test_epochs = [int(x["epoch"]) for x in test_history if "epoch" in x and "loss" in x]
+                test_losses = [float(x["loss"]) for x in test_history if "epoch" in x and "loss" in x]
+                if train_losses:
+                    best_metric = float(log.get("best_metric", log.get("best_loss", float("inf"))))
+                    best_epoch = int(log.get("best_epoch", 0))
+                else:
+                    # backward compatibility with old loss-only logs
+                    train_losses = [float(x) for x in log.get("losses", [])]
+                    train_epochs = [int(x) for x in log.get("epochs", list(range(1, len(train_losses) + 1)) if train_losses else [])]
+                    if len(train_epochs) != len(train_losses):
+                        train_epochs = list(range(1, len(train_losses) + 1)) if train_losses else []
+                    if train_losses:
+                        best_idx = int(np.argmin(np.array(train_losses)))
+                        best_metric = float(log.get("best_loss", float(train_losses[best_idx])))
+                        best_epoch = int(log.get("best_epoch", train_epochs[best_idx]))
+                    train_history = [{"epoch": e, "loss": l} for e, l in zip(train_epochs, train_losses)]
+                print(f"Restored loss history: train={len(train_losses)} test={len(test_losses)} best_metric={best_metric:.4f}")
             except Exception as e:
                 print(f"Warning: could not load loss_log.json ({e}), starting logs from epoch {start_epoch}")
-                losses = []
-                epochs_logged = []
-                best_loss = float("inf")
+                train_losses = []
+                train_epochs = []
+                test_losses = []
+                test_epochs = []
+                train_history = []
+                test_history = []
+                best_metric = float("inf")
+                best_epoch = 0
         else:
             print(f"No loss_log.json found; creating new logs from epoch {start_epoch}")
 
     for epoch in range(start_epoch, args.epochs + 1):
         epoch_start = time.perf_counter()
-        model.train()
-        running = 0.0
-        count = 0
+        train_loss = run_epoch(
+            loader=train_loader,
+            model=model,
+            loss_fn=loss_fn,
+            optimizer=optimizer,
+            scaler=scaler,
+            use_amp=use_amp,
+            grad_clip_norm=args.grad_clip_norm,
+            optim_params=optim_params,
+            device=device,
+            train=True,
+            epoch=epoch,
+            total_epochs=args.epochs,
+        )
+        train_history.append({"epoch": epoch, "loss": train_loss})
+        train_losses.append(train_loss)
+        train_epochs.append(epoch)
 
-        pbar = tqdm(loader, desc=f"Epoch {epoch}/{args.epochs}", total=len(loader))
-        for images, labels in pbar:
-            images = images.to(device=device, dtype=torch.float32, non_blocking=True)
-            labels = labels.to(device=device, non_blocking=True)
+        do_eval = (epoch % args.eval_every == 0) or (epoch == args.epochs)
+        metric_for_best = train_loss
+        if do_eval:
+            test_loss = run_epoch(
+                loader=test_loader,
+                model=model,
+                loss_fn=loss_fn,
+                optimizer=None,
+                scaler=scaler,
+                use_amp=use_amp,
+                grad_clip_norm=args.grad_clip_norm,
+                optim_params=optim_params,
+                device=device,
+                train=False,
+                epoch=epoch,
+                total_epochs=args.epochs,
+            )
+            test_history.append({"epoch": epoch, "loss": test_loss})
+            test_losses.append(test_loss)
+            test_epochs.append(epoch)
+            metric_for_best = test_loss
 
-            optimizer.zero_grad(set_to_none=True)
-
-            with torch.cuda.amp.autocast(enabled=use_amp):
-                # images: [bsz, 2, C, H, W] -> flatten views for encoding
-                bsz, n_views, c, h, w = images.shape
-                x = images.view(bsz * n_views, c, h, w)
-                feats_flat = model.encode_image(x).float()
-                feats_flat = F.normalize(feats_flat, dim=-1)
-                feats = feats_flat.view(bsz, n_views, -1)  # [bsz, 2, dim]
-                loss = loss_fn(feats, labels=labels)
-
-            if use_amp:
-                scaler.scale(loss).backward()
-                if args.grad_clip_norm is not None:
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(optim_params, args.grad_clip_norm)
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                loss.backward()
-                if args.grad_clip_norm is not None:
-                    torch.nn.utils.clip_grad_norm_(optim_params, args.grad_clip_norm)
-                optimizer.step()
-
-            running += float(loss.item())
-            count += 1
-            pbar.set_postfix(loss=f"{loss.item():.4f}", avg=f"{running/max(1,count):.4f}")
-
-        avg_loss = running / max(1, count)
-        losses.append(avg_loss)
-        epochs_logged.append(epoch)
-        is_best = avg_loss < best_loss
+        is_best = metric_for_best < best_metric
         if is_best:
-            best_loss = avg_loss
+            best_metric = metric_for_best
+            best_epoch = epoch
 
-        # write loss log each epoch; epochs_logged are actual epoch numbers (correct when resuming without log)
-        best_idx = int(np.argmin(np.array(losses))) if losses else 0
-        best_epoch = int(epochs_logged[best_idx]) if losses else epoch
+        # write loss log each epoch
         loss_log_path = out_dir / "loss_log.json"
         with open(loss_log_path, "w") as f:
             json.dump(
                 {
-                    "epochs": epochs_logged,
-                    "losses": losses,
-                    "best_loss": best_loss,
+                    "epochs": train_epochs,
+                    "losses": train_losses,
+                    "best_loss": best_metric,
                     "best_epoch": best_epoch,
+                    "best_metric": best_metric,
+                    "train_history": train_history,
+                    "test_history": test_history,
                     "batch_size": batch_size,
                     "classes_per_batch": args.classes_per_batch,
                     "samples_per_class": args.samples_per_class,
                     "contrast_mode": args.contrast_mode,
                     "temperature": args.temperature,
                     "base_temperature": base_temp,
+                    "eval_every": args.eval_every,
                 },
                 f,
                 indent=2,
@@ -660,17 +838,28 @@ def main():
                 model=model,
                 optimizer=optimizer,
                 scaler=scaler if use_amp else None,
-                loss_value=avg_loss,
+                loss_value=metric_for_best,
                 is_best=is_best,
                 args_dict=vars(args),
             )
 
         epoch_elapsed = time.perf_counter() - epoch_start
-        print(f"Epoch {epoch}: avg_loss={avg_loss:.4f} (best={best_loss:.4f})  time={epoch_elapsed:.1f}s")
+        print(
+            f"Epoch {epoch}/{args.epochs} "
+            f"train_loss={train_loss:.4f} "
+            f"best_metric={best_metric:.4f} "
+            f"time={epoch_elapsed:.1f}s"
+        )
 
-    # plot (use epochs_logged so x-axis is correct when resuming without log)
+    # plot with real epoch numbers
     loss_curve_path = out_dir / "loss_curve.png"
-    plot_loss_curve(losses, loss_curve_path, epochs=epochs_logged)
+    plot_loss_curve(
+        train_losses,
+        loss_curve_path,
+        train_epochs=train_epochs,
+        test_losses=test_losses,
+        test_epochs=test_epochs,
+    )
     print(f"[save] {loss_curve_path}")
 
     # save config
@@ -691,9 +880,13 @@ def main():
                 "classes_per_batch": args.classes_per_batch,
                 "samples_per_class": args.samples_per_class,
                 "steps_per_epoch": steps_per_epoch,
+                "test_steps_per_epoch": test_steps_per_epoch,
                 "seed": args.seed,
-                "final_loss": losses[-1] if losses else None,
-                "best_loss": best_loss,
+                "final_loss": train_losses[-1] if train_losses else None,
+                "final_test_loss": test_losses[-1] if test_losses else None,
+                "best_loss": best_metric,
+                "best_metric": best_metric,
+                "best_epoch": best_epoch,
                 "data_stats": data_stats,
                 "split_meta": split_meta,
             },
@@ -703,7 +896,7 @@ def main():
     print(f"[save] {config_path}")
 
     print("Done.")
-    print(f"Best loss: {best_loss:.4f}")
+    print(f"Best epoch: {best_epoch}  best_metric={best_metric:.4f}")
     print(f"Artifacts: {out_dir}")
 
 

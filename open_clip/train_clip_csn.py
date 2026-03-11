@@ -149,6 +149,12 @@ def freeze_clip_model(model: torch.nn.Module) -> None:
     model.eval()
 
 
+def default_split_dir_for_csv(csv_file: str | Path, seed: int, train_ratio: float) -> Path:
+    csv_path = Path(csv_file).resolve()
+    ratio_tag = int(round(float(train_ratio) * 100))
+    return csv_path.parent / f"{csv_path.stem}_splits_seed{int(seed)}_tr{ratio_tag}"
+
+
 def _records_path_hash(records) -> str:
     h = hashlib.sha1()
     for rec in records:
@@ -485,11 +491,13 @@ def main() -> None:
         exp_dir = out_root / f"{model_safe}_csn_{ts}"
     exp_dir.mkdir(parents=True, exist_ok=True)
 
+    train_ratio = 0.5
     if args.split_dir is None:
-        args.split_dir = str(exp_dir / "splits")
+        args.split_dir = str(default_split_dir_for_csv(args.csv_file, args.seed, train_ratio))
 
     print(f"Output dir: {exp_dir}")
     print(f"Device: {device}  AMP(cuda-only): {use_amp}")
+    print(f"Split dir: {args.split_dir}")
 
     # data
     records, data_stats = load_csn_records(args.csv_file, args.base_image_dir)
@@ -498,7 +506,7 @@ def main() -> None:
         split_dir=args.split_dir,
         seed=args.seed,
         force_resplit=args.force_resplit,
-        train_ratio=0.5,
+        train_ratio=train_ratio,
     )
     print(f"Loaded records: {len(records)}  train={len(train_idx)} test={len(test_idx)}")
 

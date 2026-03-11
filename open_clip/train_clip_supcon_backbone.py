@@ -177,6 +177,12 @@ def load_csn_split_samples(
     return train_samples, test_samples, data_stats, split_meta
 
 
+def default_split_dir_for_csv(csv_file: str | Path, seed: int, train_ratio: float) -> Path:
+    csv_path = Path(csv_file).resolve()
+    ratio_tag = int(round(float(train_ratio) * 100))
+    return csv_path.parent / f"{csv_path.stem}_splits_seed{int(seed)}_tr{ratio_tag}"
+
+
 def split_samples_by_superclass(
     samples: list[tuple[str, int]],
     seed: int,
@@ -588,8 +594,10 @@ def main():
 
     data_stats = None
     split_meta = None
+    train_ratio = 0.5
     if args.csv_file is not None and args.split_dir is None:
-        args.split_dir = str(out_dir / "splits")
+        args.split_dir = str(default_split_dir_for_csv(args.csv_file, args.seed, train_ratio))
+        print(f"Split dir: {args.split_dir}")
 
     # load CLIP
     model, preprocess = clip.load(args.model, device=device, jit=False)
@@ -623,12 +631,12 @@ def main():
             split_dir=args.split_dir,
             seed=args.seed,
             force_resplit=args.force_resplit,
-            train_ratio=0.5,
+            train_ratio=train_ratio,
         )
         print(f"Loaded CSV records: train={len(train_samples)} test={len(test_samples)}")
     else:
         samples = load_sop_samples(args.dataset_file, args.base_image_dir)
-        train_samples, test_samples, split_meta = split_samples_by_superclass(samples, seed=args.seed, train_ratio=0.5)
+        train_samples, test_samples, split_meta = split_samples_by_superclass(samples, seed=args.seed, train_ratio=train_ratio)
         print(f"Loaded SOP samples: total={len(samples)} train={len(train_samples)} test={len(test_samples)}")
 
     train_dataset = SuperClassDataset(samples=train_samples, transform=train_transform)

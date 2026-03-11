@@ -2,9 +2,13 @@
 """
 Finetune CLIP vision backbone with supervised contrastive (SupCon) loss.
 
-Data format (same as SOP/.data/Ebay_train.txt):
+Supported data formats:
+1) SOP-style txt (legacy):
   image_id class_id super_class_id path
   1 1 1 bicycle_final/111085122871_0.JPG
+
+2) CSN CSV (same input interface as train_clip_csn.py):
+   --csv-file + --base-image-dir + optional --split-dir/--force-resplit
 
 Training:
 - Loads OpenAI CLIP via local `CLIP/` checkout (module name: `clip`)
@@ -25,7 +29,7 @@ import random
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -45,38 +49,22 @@ if str(CLIP_DIR) not in sys.path:
 
 import clip  # type: ignore
 
+from csn_pipeline.data import create_or_load_split, load_csn_records
+
 
 # ---- dataset ----
 
 
 class SuperClassDataset(Dataset):
-    """Reads (image_path, super_class_id) from the SOP-format txt file."""
+    """Dataset of (image_path, super_class_id) samples with two augmented views."""
 
-    def __init__(self, dataset_file: str | Path, base_image_dir: str | Path | None, transform):
-        self.dataset_file = Path(dataset_file)
-        self.base_image_dir = Path(base_image_dir) if base_image_dir else None
+    def __init__(self, samples: List[Tuple[str, int]], transform):
         self.transform = transform
 
-        self.samples: List[Tuple[str, int]] = []
+        self.samples: List[Tuple[str, int]] = list(samples)
         self.class_to_indices: Dict[int, List[int]] = {}
-
-        with open(self.dataset_file, "r") as f:
-            _header = f.readline()
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                parts = line.split()
-                if len(parts) < 4:
-                    continue
-                super_class_id = int(parts[2])
-                rel_path = " ".join(parts[3:])
-                full_path = (self.base_image_dir / rel_path) if self.base_image_dir else Path(rel_path)
-                if not full_path.exists():
-                    continue
-                idx = len(self.samples)
-                self.samples.append((str(full_path), super_class_id))
-                self.class_to_indices.setdefault(super_class_id, []).append(idx)
+        for idx, (_, super_class_id) in enumerate(self.samples):
+            self.class_to_indices.setdefault(int(super_class_id), []).append(idx)
 
         self.classes: List[int] = sorted(self.class_to_indices.keys())
 
@@ -141,6 +129,51 @@ def collate_views_labels(batch):
     v2 = torch.stack(view2, dim=0)
     images = torch.stack([v1, v2], dim=1)  # [bsz, 2, C, H, W]
     return images, torch.tensor(labels, dtype=torch.long)
+
+
+def load_sop_samples(dataset_file: str | Path, base_image_dir: str | Path | None) -> list[tuple[str, int]]:
+    dataset_file = Path(dataset_file)
+    if not dataset_file.exists():
+        raise FileNotFoundError(f"Dataset file not found: {dataset_file}")
+
+    base_dir = Path(base_image_dir) if base_image_dir else None
+    samples: list[tuple[str, int]] = []
+    with open(dataset_file, "r") as f:
+        _header = f.readline()
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+            super_class_id = int(parts[2])
+            rel_path = " ".join(parts[3:])
+            full_path = (base_dir / rel_path) if base_dir else Path(rel_path)
+            if not full_path.exists():
+                continue
+            samples.append((str(full_path), int(super_class_id)))
+    return samples
+
+
+def load_csn_train_samples(
+    csv_file: str | Path,
+    base_image_dir: str | Path | None,
+    split_dir: str | Path,
+    seed: int,
+    force_resplit: bool,
+    train_ratio: float = 0.5,
+) -> tuple[list[tuple[str, int]], dict[str, Any], dict[str, Any]]:
+    records, data_stats = load_csn_records(csv_file, base_image_dir)
+    train_idx, _test_idx, split_meta = create_or_load_split(
+        records=records,
+        split_dir=split_dir,
+        seed=seed,
+        force_resplit=force_resplit,
+        train_ratio=train_ratio,
+    )
+    samples = [(records[int(i)].image_path, int(records[int(i)].superclass_id)) for i in train_idx.tolist()]
+    return samples, data_stats, split_meta
 
 
 # ---- loss ----
@@ -328,8 +361,11 @@ def build_train_transform(preprocess, image_size: int):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset-file", type=str, required=True)
+    parser.add_argument("--dataset-file", type=str, default=None, help="Legacy SOP txt input")
+    parser.add_argument("--csv-file", type=str, default=None, help="CSN CSV input (same as train_clip_csn.py)")
     parser.add_argument("--base-image-dir", type=str, default=None)
+    parser.add_argument("--split-dir", type=str, default=None, help="Used with --csv-file")
+    parser.add_argument("--force-resplit", action="store_true", help="Used with --csv-file")
 
     parser.add_argument("--model", type=str, default="ViT-B/32", help="Default: smallest ViT CLIP variant")
     def _default_device():
@@ -384,6 +420,9 @@ def main():
     args = parser.parse_args()
     set_seed(args.seed)
 
+    if (args.dataset_file is None) == (args.csv_file is None):
+        raise ValueError("Provide exactly one of --dataset-file (legacy) or --csv-file (CSN format).")
+
     if args.device is None:
         args.device = _default_device()
     if args.device == "mps" and (not getattr(torch.backends, "mps", None) or not torch.backends.mps.is_available()):
@@ -417,6 +456,11 @@ def main():
     print(f"Device: {device}")
     print(f"Model: {args.model}")
 
+    data_stats = None
+    split_meta = None
+    if args.csv_file is not None and args.split_dir is None:
+        args.split_dir = str(out_dir / "splits")
+
     # load CLIP
     model, preprocess = clip.load(args.model, device=device, jit=False)
     # ensure float32 weights for finetuning (AMP handles mixed precision)
@@ -442,7 +486,21 @@ def main():
     image_size = getattr(model.visual, "input_resolution", 224)
     train_transform = build_train_transform(preprocess, int(image_size))
 
-    dataset = SuperClassDataset(args.dataset_file, args.base_image_dir, transform=train_transform)
+    if args.csv_file is not None:
+        samples, data_stats, split_meta = load_csn_train_samples(
+            csv_file=args.csv_file,
+            base_image_dir=args.base_image_dir,
+            split_dir=args.split_dir,
+            seed=args.seed,
+            force_resplit=args.force_resplit,
+            train_ratio=0.5,
+        )
+        print(f"Loaded CSV records for train split: {len(samples)} samples")
+    else:
+        samples = load_sop_samples(args.dataset_file, args.base_image_dir)
+        print(f"Loaded SOP samples: {len(samples)}")
+
+    dataset = SuperClassDataset(samples=samples, transform=train_transform)
     if len(dataset) == 0:
         raise ValueError("Dataset contains 0 valid images. Check paths/base-image-dir.")
 
@@ -636,6 +694,8 @@ def main():
                 "seed": args.seed,
                 "final_loss": losses[-1] if losses else None,
                 "best_loss": best_loss,
+                "data_stats": data_stats,
+                "split_meta": split_meta,
             },
             f,
             indent=2,
@@ -649,4 +709,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

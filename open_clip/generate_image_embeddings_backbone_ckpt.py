@@ -20,6 +20,7 @@ Outputs:
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 from pathlib import Path
 from typing import List, Tuple
@@ -60,6 +61,111 @@ def load_dataset(dataset_file: str | Path, base_image_dir: str | Path | None) ->
                 continue
             samples.append((str(full_path), super_class_id))
     return samples
+
+
+def _path_key_variants(path_like: str) -> set[str]:
+    p = Path(path_like)
+    raw = str(path_like).strip()
+    out = {raw, raw.replace("\\", "/"), p.as_posix(), p.as_posix().lstrip("./")}
+    try:
+        rp = p.resolve()
+        out.add(str(rp))
+        out.add(rp.as_posix())
+    except Exception:
+        pass
+    return {x for x in out if x}
+
+
+def _parse_quality_score(raw: str) -> float:
+    s = str(raw).strip()
+    low = s.lower()
+    if low in {"true", "t", "yes", "y"}:
+        return 1.0
+    if low in {"false", "f", "no", "n"}:
+        return 0.0
+    return float(s)
+
+
+def load_quality_scores(
+    quality_csv: str | Path,
+    score_column: str,
+    base_image_dir: str | Path | None,
+) -> tuple[dict[str, float], dict[str, int]]:
+    quality_csv = Path(quality_csv)
+    if not quality_csv.exists():
+        raise FileNotFoundError(f"Quality CSV not found: {quality_csv}")
+
+    base_dir = Path(base_image_dir) if base_image_dir else None
+    quality_map: dict[str, float] = {}
+    stats = {"rows_total": 0, "rows_parsed": 0, "rows_bad_score": 0, "rows_missing_path": 0}
+
+    with open(quality_csv, "r", newline="") as f:
+        reader = csv.DictReader(f)
+        cols = set(reader.fieldnames or [])
+        if "image_path" not in cols:
+            raise ValueError("Quality CSV must contain 'image_path' column")
+        if score_column not in cols:
+            raise ValueError(f"Quality CSV missing score column '{score_column}'")
+
+        for row in reader:
+            stats["rows_total"] += 1
+            rel_path = str(row.get("image_path", "")).strip()
+            if not rel_path:
+                stats["rows_missing_path"] += 1
+                continue
+            try:
+                score = _parse_quality_score(str(row.get(score_column, "")))
+            except Exception:
+                stats["rows_bad_score"] += 1
+                continue
+
+            for k in _path_key_variants(rel_path):
+                quality_map[k] = score
+            if base_dir is not None:
+                abs_path = (base_dir / rel_path).resolve()
+                for k in _path_key_variants(str(abs_path)):
+                    quality_map[k] = score
+            stats["rows_parsed"] += 1
+
+    if not quality_map:
+        raise ValueError(f"No usable quality scores found in {quality_csv}")
+    return quality_map, stats
+
+
+def filter_samples_by_quality(
+    samples: list[tuple[str, int]],
+    quality_map: dict[str, float],
+    cutoff: float,
+) -> tuple[list[tuple[str, int]], dict[str, int]]:
+    kept: list[tuple[str, int]] = []
+    matched = 0
+    dropped_below = 0
+    missing_score_kept = 0
+
+    for path, sid in samples:
+        score = None
+        for k in _path_key_variants(path):
+            if k in quality_map:
+                score = quality_map[k]
+                break
+        if score is None:
+            missing_score_kept += 1
+            kept.append((path, sid))
+            continue
+        matched += 1
+        if float(score) >= float(cutoff):
+            kept.append((path, sid))
+        else:
+            dropped_below += 1
+
+    stats = {
+        "input_count": int(len(samples)),
+        "kept_count": int(len(kept)),
+        "matched_scores": int(matched),
+        "dropped_below_cutoff": int(dropped_below),
+        "missing_score_kept": int(missing_score_kept),
+    }
+    return kept, stats
 
 
 def load_backbone_checkpoint(model: torch.nn.Module, checkpoint_path: Path) -> dict:
@@ -104,6 +210,19 @@ def main():
     parser.add_argument("--output-dir", type=str, default="./embeddings")
     parser.add_argument("--output-prefix", type=str, default=None)
     parser.add_argument("--normalize", action="store_true", default=True, help="L2-normalize embeddings (default: True)")
+    parser.add_argument("--quality-csv", type=str, default=None, help="Optional quality CSV with image_path + score")
+    parser.add_argument(
+        "--quality-score-column",
+        type=str,
+        default="agreement_score",
+        help="Score column in quality CSV (e.g. agreement_score, is_valid)",
+    )
+    parser.add_argument(
+        "--quality-cutoff",
+        type=float,
+        default=None,
+        help="Keep sample if score >= cutoff (required when --quality-csv is provided)",
+    )
     args = parser.parse_args()
 
     if args.device is None:
@@ -134,6 +253,36 @@ def main():
     samples = load_dataset(dataset_file, args.base_image_dir)
     if not samples:
         raise ValueError("No valid samples found. Check dataset paths/base-image-dir.")
+
+    quality_filter = None
+    if args.quality_csv is not None:
+        if args.quality_cutoff is None:
+            raise ValueError("--quality-cutoff is required when --quality-csv is provided")
+        quality_map, quality_csv_stats = load_quality_scores(
+            quality_csv=args.quality_csv,
+            score_column=args.quality_score_column,
+            base_image_dir=args.base_image_dir,
+        )
+        samples, filter_stats = filter_samples_by_quality(
+            samples=samples,
+            quality_map=quality_map,
+            cutoff=float(args.quality_cutoff),
+        )
+        quality_filter = {
+            "quality_csv": str(Path(args.quality_csv).resolve()),
+            "score_column": str(args.quality_score_column),
+            "cutoff": float(args.quality_cutoff),
+            "quality_csv_stats": quality_csv_stats,
+            "filter_stats": filter_stats,
+        }
+        print(
+            "Quality filtering: "
+            f"kept={filter_stats['kept_count']} / {filter_stats['input_count']}  "
+            f"dropped_below_cutoff={filter_stats['dropped_below_cutoff']}  "
+            f"missing_score_kept={filter_stats['missing_score_kept']}"
+        )
+        if not samples:
+            raise ValueError("No samples left after quality filtering")
 
     # load base CLIP model & preprocess
     model, preprocess = clip.load(args.model, device=device, jit=False)
@@ -199,6 +348,7 @@ def main():
         "model": args.model,
         "device": str(device),
         "normalized": bool(args.normalize),
+        "quality_filter": quality_filter,
         "checkpoint": ckpt_info,
     }
     with open(meta_path, "w") as f:
@@ -211,4 +361,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

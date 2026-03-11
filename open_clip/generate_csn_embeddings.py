@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 import sys
 from pathlib import Path
@@ -59,148 +58,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=str, default="./embeddings")
     parser.add_argument("--output-prefix", type=str, default="csn_test")
     parser.add_argument("--normalize", action="store_true", default=True)
-    parser.add_argument("--quality-csv", type=str, default=None, help="Optional quality CSV with image_path + score")
-    parser.add_argument(
-        "--quality-score-column",
-        type=str,
-        default="agreement_score",
-        help="Column name in --quality-csv to threshold (e.g. agreement_score, is_valid)",
-    )
-    parser.add_argument(
-        "--quality-cutoff",
-        type=float,
-        default=None,
-        help="Keep sample if score >= cutoff (required when --quality-csv is used)",
-    )
     return parser.parse_args()
-
-
-def _path_keys(path_like: str, base_image_dir: Path | None = None) -> set[str]:
-    p = Path(path_like)
-    keys: set[str] = set()
-
-    raw = str(path_like).strip()
-    if raw:
-        raw_norm = raw.replace("\\", "/")
-        keys.add(raw_norm)
-        keys.add(raw_norm.lstrip("./"))
-
-    keys.add(p.as_posix())
-    keys.add(p.as_posix().lstrip("./"))
-
-    if base_image_dir is not None and not p.is_absolute():
-        p_base = (base_image_dir / p).resolve()
-        keys.add(str(p_base))
-        keys.add(p_base.as_posix())
-
-    try:
-        p_resolve = p.resolve()
-        keys.add(str(p_resolve))
-        keys.add(p_resolve.as_posix())
-    except Exception:
-        pass
-
-    return {k for k in keys if k}
-
-
-def _parse_quality_score(raw: str) -> float:
-    s = str(raw).strip()
-    if not s:
-        raise ValueError("empty score")
-    sl = s.lower()
-    if sl in {"true", "t", "yes", "y"}:
-        return 1.0
-    if sl in {"false", "f", "no", "n"}:
-        return 0.0
-    return float(s)
-
-
-def load_quality_scores(
-    quality_csv: str | Path,
-    score_column: str,
-    base_image_dir: str | Path | None = None,
-) -> tuple[dict[str, float], dict[str, int]]:
-    quality_csv = Path(quality_csv)
-    if not quality_csv.exists():
-        raise FileNotFoundError(f"Quality CSV not found: {quality_csv}")
-
-    base_dir = Path(base_image_dir) if base_image_dir else None
-    scores: dict[str, float] = {}
-    stats = {
-        "rows_total": 0,
-        "rows_parsed": 0,
-        "rows_missing_path": 0,
-        "rows_bad_score": 0,
-    }
-
-    with open(quality_csv, "r", newline="") as f:
-        reader = csv.DictReader(f)
-        cols = set(reader.fieldnames or [])
-        if "image_path" not in cols:
-            raise ValueError(f"Quality CSV missing required column: image_path ({quality_csv})")
-        if score_column not in cols:
-            raise ValueError(f"Quality CSV missing score column '{score_column}' ({quality_csv})")
-
-        for row in reader:
-            stats["rows_total"] += 1
-            raw_path = str(row.get("image_path", "")).strip()
-            if not raw_path:
-                stats["rows_missing_path"] += 1
-                continue
-
-            try:
-                score = _parse_quality_score(str(row.get(score_column, "")))
-            except Exception:
-                stats["rows_bad_score"] += 1
-                continue
-
-            for k in _path_keys(raw_path, base_dir):
-                scores[k] = score
-            stats["rows_parsed"] += 1
-
-    if not scores:
-        raise ValueError(f"No valid quality scores loaded from {quality_csv}")
-    return scores, stats
-
-
-def filter_indices_by_quality(
-    records,
-    split_indices: np.ndarray,
-    quality_scores: dict[str, float],
-    cutoff: float,
-) -> tuple[np.ndarray, dict[str, int]]:
-    kept: list[int] = []
-    dropped_below = 0
-    missing_score_kept = 0
-    matched_scores = 0
-
-    for idx in split_indices.astype(np.int64).tolist():
-        r = records[int(idx)]
-        score = None
-        for k in _path_keys(r.image_path, base_image_dir=None):
-            if k in quality_scores:
-                score = quality_scores[k]
-                break
-
-        if score is None:
-            missing_score_kept += 1
-            kept.append(int(idx))
-            continue
-
-        matched_scores += 1
-        if float(score) >= float(cutoff):
-            kept.append(int(idx))
-        else:
-            dropped_below += 1
-
-    stats = {
-        "input_count": int(split_indices.shape[0]),
-        "kept_count": int(len(kept)),
-        "dropped_below_cutoff": int(dropped_below),
-        "matched_scores": int(matched_scores),
-        "missing_score_kept": int(missing_score_kept),
-    }
-    return np.asarray(kept, dtype=np.int64), stats
 
 
 def main() -> None:
@@ -215,37 +73,6 @@ def main() -> None:
     max_idx = len(records) - 1
     if int(split_indices.max()) > max_idx:
         raise ValueError("split_indices contains index beyond record count")
-
-    quality_filter = None
-    if args.quality_csv is not None:
-        if args.quality_cutoff is None:
-            raise ValueError("--quality-cutoff is required when --quality-csv is provided.")
-        quality_scores, quality_csv_stats = load_quality_scores(
-            quality_csv=args.quality_csv,
-            score_column=args.quality_score_column,
-            base_image_dir=args.base_image_dir,
-        )
-        split_indices, quality_filter_stats = filter_indices_by_quality(
-            records=records,
-            split_indices=split_indices,
-            quality_scores=quality_scores,
-            cutoff=float(args.quality_cutoff),
-        )
-        quality_filter = {
-            "quality_csv": str(Path(args.quality_csv).resolve()),
-            "score_column": str(args.quality_score_column),
-            "cutoff": float(args.quality_cutoff),
-            "quality_csv_stats": quality_csv_stats,
-            "filter_stats": quality_filter_stats,
-        }
-        print(
-            "Quality filtering: "
-            f"kept={quality_filter_stats['kept_count']} / {quality_filter_stats['input_count']}  "
-            f"dropped_below_cutoff={quality_filter_stats['dropped_below_cutoff']}  "
-            f"missing_score_kept={quality_filter_stats['missing_score_kept']}"
-        )
-        if split_indices.size == 0:
-            raise ValueError("No samples left after quality filtering.")
 
     model, preprocess = clip.load(args.model, device=device, jit=False)
     model = model.float().eval()
@@ -369,7 +196,6 @@ def main() -> None:
         "normalize": bool(args.normalize),
         "num_samples": int(image_super.shape[0]),
         "proj_dim": int(image_super.shape[1]),
-        "quality_filter": quality_filter,
         "outputs": {k: str(v) for k, v in out_files.items()},
     }
     with open(out_files["metadata"], "w") as f:

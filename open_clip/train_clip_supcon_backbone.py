@@ -13,7 +13,7 @@ Supported data formats:
 Training:
 - Loads OpenAI CLIP via local `CLIP/` checkout (module name: `clip`)
 - Finetunes ONLY the vision tower (image encoder) end-to-end (no projection head)
-- Positives are other images with the same `super_class_id` within the batch
+- Positives are other images with the same category label within the batch
 - Uses PK sampling to ensure each batch contains >=2 samples per class
 
 Outputs:
@@ -56,15 +56,15 @@ from csn_pipeline.data import create_or_load_split, load_csn_records
 
 
 class SuperClassDataset(Dataset):
-    """Dataset of (image_path, super_class_id) samples with two augmented views."""
+    """Dataset of (image_path, category_id) samples with two augmented views."""
 
     def __init__(self, samples: List[Tuple[str, int]], transform):
         self.transform = transform
 
         self.samples: List[Tuple[str, int]] = list(samples)
         self.class_to_indices: Dict[int, List[int]] = {}
-        for idx, (_, super_class_id) in enumerate(self.samples):
-            self.class_to_indices.setdefault(int(super_class_id), []).append(idx)
+        for idx, (_, category_id) in enumerate(self.samples):
+            self.class_to_indices.setdefault(int(category_id), []).append(idx)
 
         self.classes: List[int] = sorted(self.class_to_indices.keys())
 
@@ -72,12 +72,12 @@ class SuperClassDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx: int):
-        image_path, super_class_id = self.samples[idx]
+        image_path, category_id = self.samples[idx]
         image = Image.open(image_path).convert("RGB")
         # SimCLR / SupCon style: two augmented views of the same image
         view1 = self.transform(image)
         view2 = self.transform(image)
-        return view1, view2, super_class_id
+        return view1, view2, category_id
 
 
 class PKBatchSampler(Sampler[List[int]]):
@@ -147,12 +147,12 @@ def load_sop_samples(dataset_file: str | Path, base_image_dir: str | Path | None
             parts = line.split()
             if len(parts) < 4:
                 continue
-            super_class_id = int(parts[2])
+            category_id = int(parts[1])
             rel_path = " ".join(parts[3:])
             full_path = (base_dir / rel_path) if base_dir else Path(rel_path)
             if not full_path.exists():
                 continue
-            samples.append((str(full_path), int(super_class_id)))
+            samples.append((str(full_path), int(category_id)))
     return samples
 
 
@@ -172,8 +172,8 @@ def load_csn_split_samples(
         force_resplit=force_resplit,
         train_ratio=train_ratio,
     )
-    train_samples = [(records[int(i)].image_path, int(records[int(i)].superclass_id)) for i in train_idx.tolist()]
-    test_samples = [(records[int(i)].image_path, int(records[int(i)].superclass_id)) for i in test_idx.tolist()]
+    train_samples = [(records[int(i)].image_path, int(records[int(i)].category_id)) for i in train_idx.tolist()]
+    test_samples = [(records[int(i)].image_path, int(records[int(i)].category_id)) for i in test_idx.tolist()]
     return train_samples, test_samples, data_stats, split_meta
 
 

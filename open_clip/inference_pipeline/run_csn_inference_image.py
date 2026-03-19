@@ -1,16 +1,12 @@
 #!/usr/bin/env python3
-"""CSN inference: recall/precision, optional distributions, t-SNE, and tail-sample analysis.
-
-Supports:
-- Single-space mode via --embeddings + --labels
-- Multi-space CSN mode via --prefix-metadata from generate_csn_embeddings.py
-"""
+"""Image-only CSN inference: retrieval metrics + extended evaluation analysis."""
 
 from __future__ import annotations
 
 import argparse
 import csv
 import json
+import math
 import textwrap
 from pathlib import Path
 
@@ -20,6 +16,7 @@ import numpy as np
 import torch
 from PIL import Image
 from sklearn.manifold import TSNE
+from sklearn.neighbors import NearestNeighbors
 from tqdm import tqdm
 
 
@@ -85,16 +82,37 @@ def compute_bits_left_stats(
     }
 
 
-def compute_retrieval_metrics_at_k(
+def _init_purity_accumulator(k_list: list[int]) -> dict[int, dict[str, int]]:
+    return {k: {"slots": 0, "diff_cat_same_super": 0, "diff_super": 0} for k in k_list}
+
+
+def _purity_percent_from_counts(counts: dict[str, int]) -> dict[str, float]:
+    slots = int(counts["slots"])
+    if slots <= 0:
+        return {
+            "pct_diff_category_same_superclass": 0.0,
+            "pct_diff_superclass": 0.0,
+            "slots": 0,
+        }
+    return {
+        "pct_diff_category_same_superclass": 100.0 * float(counts["diff_cat_same_super"]) / float(slots),
+        "pct_diff_superclass": 100.0 * float(counts["diff_super"]) / float(slots),
+        "slots": slots,
+    }
+
+
+def compute_retrieval_and_purity_at_k(
     embeddings: np.ndarray,
-    labels: np.ndarray,
+    labels_eval: np.ndarray,
+    category_ids: np.ndarray | None,
+    superclass_ids: np.ndarray | None,
     k_list: list[int],
     device: torch.device,
     batch_size: int = 512,
-) -> tuple[dict[int, float], dict[int, float], list[int]]:
+) -> tuple[dict[int, float], dict[int, float], dict[int, dict[str, float]] | None, list[int]]:
     emb = torch.from_numpy(embeddings).float().to(device)
     emb = torch.nn.functional.normalize(emb, dim=1)
-    labels_t = torch.from_numpy(labels).to(device)
+    labels_t = torch.from_numpy(labels_eval).to(device)
     n = emb.shape[0]
 
     if n < 2:
@@ -109,6 +127,12 @@ def compute_retrieval_metrics_at_k(
 
     recall_hits = {k: 0 for k in requested_k}
     precision_sum = {k: 0.0 for k in requested_k}
+
+    use_purity = category_ids is not None and superclass_ids is not None
+    purity_counts = _init_purity_accumulator(requested_k) if use_purity else None
+    if use_purity:
+        cat_t = torch.from_numpy(category_ids).to(device)
+        sup_t = torch.from_numpy(superclass_ids).to(device)
 
     for i in tqdm(range(0, n, batch_size), desc="Recall/Precision@k"):
         end = min(i + batch_size, n)
@@ -127,10 +151,31 @@ def compute_retrieval_metrics_at_k(
             recall_hits[k_req] += int(top_same.any(dim=1).sum().item())
             precision_sum[k_req] += float(top_same.float().mean(dim=1).sum().item())
 
+        if use_purity and purity_counts is not None:
+            q_cat = cat_t[i:end]
+            q_sup = sup_t[i:end]
+            r_cat = cat_t[topk_idx]
+            r_sup = sup_t[topk_idx]
+            for k_req in requested_k:
+                kk = min(k_req, max_allowed_k)
+                rc = r_cat[:, :kk]
+                rs = r_sup[:, :kk]
+                diff_cat_same_super = (rc != q_cat.unsqueeze(1)) & (rs == q_sup.unsqueeze(1))
+                diff_super = rs != q_sup.unsqueeze(1)
+
+                purity_counts[k_req]["diff_cat_same_super"] += int(diff_cat_same_super.sum().item())
+                purity_counts[k_req]["diff_super"] += int(diff_super.sum().item())
+                purity_counts[k_req]["slots"] += int((end - i) * kk)
+
     recall = {k: recall_hits[k] / n for k in requested_k}
     precision = {k: precision_sum[k] / n for k in requested_k}
     clipped_k = sorted(k for k in requested_k if k > max_allowed_k)
-    return recall, precision, clipped_k
+
+    purity = None
+    if use_purity and purity_counts is not None:
+        purity = {k: _purity_percent_from_counts(purity_counts[k]) for k in requested_k}
+
+    return recall, precision, purity, clipped_k
 
 
 def compute_match_nonmatch_distribution(
@@ -294,7 +339,7 @@ def plot_tsne(
                 zorder=6,
             )
 
-        handles, legend_labels = plt.gca().get_legend_handles_labels()
+        handles, _ = plt.gca().get_legend_handles_labels()
         if handles:
             plt.legend(loc="best")
 
@@ -303,7 +348,6 @@ def plot_tsne(
         if contour_labels.shape[0] != labels.shape[0]:
             raise ValueError("contour_labels length must match labels length")
 
-        # 90% probability mass for 2D Gaussian => chi-square(df=2, p=0.90) ≈ 4.605
         chi2_q_90_df2 = 4.605170186
         contour_classes = np.unique(contour_labels)
         cmap_contour = plt.cm.get_cmap("tab20", max(int(contour_classes.shape[0]), 1))
@@ -348,7 +392,7 @@ def plot_tsne(
 
         if contour_count > 0:
             print(f"Plotted {contour_count} superclass 90% contours.")
-            handles, legend_labels = plt.gca().get_legend_handles_labels()
+            handles, _ = plt.gca().get_legend_handles_labels()
             if handles:
                 plt.legend(loc="best")
 
@@ -595,22 +639,376 @@ def generate_tail_sample_analysis(
     print(f"Saved: {summary_path}")
 
 
+def summarize_values(values: np.ndarray) -> dict[str, float | int | None]:
+    if values.size == 0:
+        return {
+            "count": 0,
+            "mean": None,
+            "std": None,
+            "min": None,
+            "p25": None,
+            "median": None,
+            "p75": None,
+            "max": None,
+        }
+    return {
+        "count": int(values.size),
+        "mean": float(np.mean(values)),
+        "std": float(np.std(values)),
+        "min": float(np.min(values)),
+        "p25": float(np.percentile(values, 25)),
+        "median": float(np.percentile(values, 50)),
+        "p75": float(np.percentile(values, 75)),
+        "max": float(np.max(values)),
+    }
+
+
+def save_hist(values: np.ndarray, out_path: Path, title: str, x_label: str, bins: int = 50) -> None:
+    plt.figure(figsize=(8, 4))
+    if values.size > 0:
+        plt.hist(values, bins=bins, alpha=0.85)
+    else:
+        plt.text(
+            0.5,
+            0.5,
+            "No valid samples",
+            ha="center",
+            va="center",
+            transform=plt.gca().transAxes,
+        )
+        plt.xlim(0, 1)
+    plt.xlabel(x_label)
+    plt.ylabel("Count")
+    plt.title(title)
+    plt.grid(alpha=0.25)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150)
+    plt.close()
+    print(f"Saved: {out_path}")
+
+
+def compute_covariance_summary(
+    emb_norm: np.ndarray,
+    labels: np.ndarray,
+    out_csv: Path,
+    label_col_name: str,
+) -> dict[str, float | int | None]:
+    rows: list[dict[str, float | int]] = []
+    classes = np.unique(labels)
+    d = emb_norm.shape[1]
+
+    for c in classes:
+        idx = np.where(labels == c)[0]
+        x = emb_norm[idx]
+        if x.shape[0] <= 1:
+            var = np.zeros((d,), dtype=np.float32)
+        else:
+            var = np.var(x, axis=0, ddof=0)
+        trace = float(np.sum(var))
+        rows.append(
+            {
+                label_col_name: int(c),
+                "count": int(x.shape[0]),
+                "cov_trace": trace,
+                "cov_mean_diag_var": float(trace / max(d, 1)),
+            }
+        )
+
+    rows.sort(key=lambda r: int(r[label_col_name]))
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_csv, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=[label_col_name, "count", "cov_trace", "cov_mean_diag_var"])
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"Saved: {out_csv}")
+
+    counts = np.asarray([r["count"] for r in rows], dtype=np.float64)
+    traces = np.asarray([r["cov_trace"] for r in rows], dtype=np.float64)
+    mean_diag = np.asarray([r["cov_mean_diag_var"] for r in rows], dtype=np.float64)
+
+    weighted_mean_trace = float(np.sum(counts * traces) / max(np.sum(counts), 1.0))
+    weighted_mean_diag = float(np.sum(counts * mean_diag) / max(np.sum(counts), 1.0))
+
+    return {
+        "num_classes": int(classes.shape[0]),
+        "total_samples": int(emb_norm.shape[0]),
+        "mean_trace_unweighted": float(np.mean(traces)) if traces.size else None,
+        "mean_trace_weighted": weighted_mean_trace,
+        "mean_diag_var_unweighted": float(np.mean(mean_diag)) if mean_diag.size else None,
+        "mean_diag_var_weighted": weighted_mean_diag,
+        "min_trace": float(np.min(traces)) if traces.size else None,
+        "max_trace": float(np.max(traces)) if traces.size else None,
+        "csv_path": str(out_csv),
+    }
+
+
+def compute_angular_distance_analysis(
+    emb_norm: np.ndarray,
+    category_ids: np.ndarray,
+    out_dir: Path,
+) -> dict[str, Any]:
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    categories = np.unique(category_ids)
+    centers: dict[int, np.ndarray] = {}
+    for c in categories:
+        idx = np.where(category_ids == c)[0]
+        center = emb_norm[idx].mean(axis=0)
+        center = center / max(np.linalg.norm(center), 1e-12)
+        centers[int(c)] = center.astype(np.float32)
+
+    own_cos = np.empty((emb_norm.shape[0],), dtype=np.float32)
+    for i in range(emb_norm.shape[0]):
+        c = int(category_ids[i])
+        own_cos[i] = float(np.dot(emb_norm[i], centers[c]))
+
+    own_cos = np.clip(own_cos, -1.0, 1.0)
+    angles_deg = np.degrees(np.arccos(own_cos)).astype(np.float32)
+
+    hist_path = out_dir / "angular_distance_to_own_category_center.png"
+    save_hist(
+        values=angles_deg,
+        out_path=hist_path,
+        title="Angular Distance to Own Category Center",
+        x_label="Angle (degrees)",
+        bins=50,
+    )
+
+    per_category_rows: list[dict[str, float | int | None]] = []
+    for c in categories:
+        idx = np.where(category_ids == c)[0]
+        stats = summarize_values(angles_deg[idx])
+        per_category_rows.append(
+            {
+                "category_id": int(c),
+                **stats,
+            }
+        )
+
+    per_cat_csv = out_dir / "angular_distance_by_category.csv"
+    with open(per_cat_csv, "w", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=["category_id", "count", "mean", "std", "min", "p25", "median", "p75", "max"],
+        )
+        writer.writeheader()
+        writer.writerows(per_category_rows)
+    print(f"Saved: {per_cat_csv}")
+
+    return {
+        "global": summarize_values(angles_deg),
+        "hist_path": str(hist_path),
+        "per_category_csv": str(per_cat_csv),
+    }
+
+
+def compute_margin_analysis(
+    emb_norm: np.ndarray,
+    category_ids: np.ndarray,
+    superclass_ids: np.ndarray,
+    out_dir: Path,
+    ann_candidates: int,
+    max_k: int,
+) -> dict[str, Any]:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    by_category_dir = out_dir / "by_category"
+    by_category_dir.mkdir(parents=True, exist_ok=True)
+
+    n = emb_norm.shape[0]
+    candidate_k = int(min(max(n - 1, 1), max(int(max_k), int(ann_candidates))))
+
+    nn = NearestNeighbors(metric="cosine", algorithm="auto")
+    nn.fit(emb_norm)
+    query_k = min(n, candidate_k + 1)
+    dists, inds = nn.kneighbors(emb_norm, n_neighbors=query_k, return_distance=True)
+
+    intra_global: list[float] = []
+    inter_global: list[float] = []
+
+    categories = np.unique(category_ids)
+    by_cat: dict[int, dict[str, Any]] = {
+        int(c): {"intra": [], "inter": [], "skipped_intra": 0, "skipped_inter": 0} for c in categories
+    }
+
+    skipped_intra_global = 0
+    skipped_inter_global = 0
+
+    for i in range(n):
+        neigh_idx_full = inds[i]
+        neigh_dist_full = dists[i]
+
+        self_mask = neigh_idx_full != i
+        neigh_idx = neigh_idx_full[self_mask][:candidate_k]
+        neigh_dist = neigh_dist_full[self_mask][:candidate_k]
+        if neigh_idx.size == 0:
+            skipped_intra_global += 1
+            skipped_inter_global += 1
+            by_cat[int(category_ids[i])]["skipped_intra"] += 1
+            by_cat[int(category_ids[i])]["skipped_inter"] += 1
+            continue
+
+        q_cat = int(category_ids[i])
+        q_sup = int(superclass_ids[i])
+
+        neigh_cat = category_ids[neigh_idx]
+        neigh_sup = superclass_ids[neigh_idx]
+
+        pos_mask = neigh_cat == q_cat
+        cat_neg_same_super_mask = (neigh_sup == q_sup) & (neigh_cat != q_cat)
+        super_neg_mask = neigh_sup != q_sup
+
+        if np.any(pos_mask) and np.any(cat_neg_same_super_mask):
+            pos_min = float(np.min(neigh_dist[pos_mask]))
+            neg_min = float(np.min(neigh_dist[cat_neg_same_super_mask]))
+            margin = pos_min - neg_min
+            intra_global.append(margin)
+            by_cat[q_cat]["intra"].append(margin)
+        else:
+            skipped_intra_global += 1
+            by_cat[q_cat]["skipped_intra"] += 1
+
+        if np.any(pos_mask) and np.any(super_neg_mask):
+            pos_min = float(np.min(neigh_dist[pos_mask]))
+            neg_min = float(np.min(neigh_dist[super_neg_mask]))
+            margin = pos_min - neg_min
+            inter_global.append(margin)
+            by_cat[q_cat]["inter"].append(margin)
+        else:
+            skipped_inter_global += 1
+            by_cat[q_cat]["skipped_inter"] += 1
+
+    intra_arr = np.asarray(intra_global, dtype=np.float32)
+    inter_arr = np.asarray(inter_global, dtype=np.float32)
+
+    global_intra_plot = out_dir / "margin_global_intra_superclass.png"
+    global_inter_plot = out_dir / "margin_global_inter_superclass.png"
+    save_hist(
+        values=intra_arr,
+        out_path=global_intra_plot,
+        title="Intra-Superclass Margin (Global)",
+        x_label="min(category+) - min(category- same super)",
+        bins=50,
+    )
+    save_hist(
+        values=inter_arr,
+        out_path=global_inter_plot,
+        title="Inter-Superclass Margin (Global)",
+        x_label="min(category+) - min(superclass-)",
+        bins=50,
+    )
+
+    per_category_rows: list[dict[str, float | int | None]] = []
+    for c in categories:
+        c_int = int(c)
+        intra_vals = np.asarray(by_cat[c_int]["intra"], dtype=np.float32)
+        inter_vals = np.asarray(by_cat[c_int]["inter"], dtype=np.float32)
+
+        save_hist(
+            values=intra_vals,
+            out_path=by_category_dir / f"category_{c_int}_margin_intra_superclass.png",
+            title=f"Intra-Superclass Margin (Category {c_int})",
+            x_label="min(category+) - min(category- same super)",
+            bins=30,
+        )
+        save_hist(
+            values=inter_vals,
+            out_path=by_category_dir / f"category_{c_int}_margin_inter_superclass.png",
+            title=f"Inter-Superclass Margin (Category {c_int})",
+            x_label="min(category+) - min(superclass-)",
+            bins=30,
+        )
+
+        intra_stats = summarize_values(intra_vals)
+        inter_stats = summarize_values(inter_vals)
+
+        per_category_rows.append(
+            {
+                "category_id": c_int,
+                "intra_count": int(intra_stats["count"]),
+                "intra_mean": intra_stats["mean"],
+                "intra_std": intra_stats["std"],
+                "intra_median": intra_stats["median"],
+                "intra_min": intra_stats["min"],
+                "intra_max": intra_stats["max"],
+                "intra_skipped": int(by_cat[c_int]["skipped_intra"]),
+                "inter_count": int(inter_stats["count"]),
+                "inter_mean": inter_stats["mean"],
+                "inter_std": inter_stats["std"],
+                "inter_median": inter_stats["median"],
+                "inter_min": inter_stats["min"],
+                "inter_max": inter_stats["max"],
+                "inter_skipped": int(by_cat[c_int]["skipped_inter"]),
+            }
+        )
+
+    per_cat_csv = out_dir / "margin_by_category_summary.csv"
+    with open(per_cat_csv, "w", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "category_id",
+                "intra_count",
+                "intra_mean",
+                "intra_std",
+                "intra_median",
+                "intra_min",
+                "intra_max",
+                "intra_skipped",
+                "inter_count",
+                "inter_mean",
+                "inter_std",
+                "inter_median",
+                "inter_min",
+                "inter_max",
+                "inter_skipped",
+            ],
+        )
+        writer.writeheader()
+        writer.writerows(per_category_rows)
+    print(f"Saved: {per_cat_csv}")
+
+    global_summary = {
+        "candidate_pool_k": int(candidate_k),
+        "intra_superclass_margin": {
+            **summarize_values(intra_arr),
+            "skipped": int(skipped_intra_global),
+            "global_plot": str(global_intra_plot),
+        },
+        "inter_superclass_margin": {
+            **summarize_values(inter_arr),
+            "skipped": int(skipped_inter_global),
+            "global_plot": str(global_inter_plot),
+        },
+        "per_category_csv": str(per_cat_csv),
+        "per_category_plot_dir": str(by_category_dir),
+    }
+
+    global_json = out_dir / "margin_global_summary.json"
+    with open(global_json, "w") as f:
+        json.dump(global_summary, f, indent=2)
+    print(f"Saved: {global_json}")
+
+    return global_summary
+
+
 def evaluate_space(
     embeddings: np.ndarray,
-    labels: np.ndarray,
+    labels_eval: np.ndarray,
     args: argparse.Namespace,
     device: torch.device,
     output_dir: Path,
     tag: str,
     image_paths: list[str] | None,
+    category_ids: np.ndarray | None,
+    superclass_ids: np.ndarray | None,
     center_overlay_labels: np.ndarray | None = None,
     center_overlay_name: str = "Centers",
     contour_overlay_labels: np.ndarray | None = None,
     contour_overlay_name: str = "Superclass 90% contours",
     embedding_mode: str = "unknown",
 ) -> None:
-    if labels.shape[0] != embeddings.shape[0]:
-        raise ValueError(f"Shape mismatch for {tag}: embeddings={embeddings.shape[0]}, labels={labels.shape[0]}")
+    if labels_eval.shape[0] != embeddings.shape[0]:
+        raise ValueError(f"Shape mismatch for {tag}: embeddings={embeddings.shape[0]}, labels={labels_eval.shape[0]}")
     if center_overlay_labels is not None and center_overlay_labels.shape[0] != embeddings.shape[0]:
         raise ValueError(
             f"Shape mismatch for {tag}: center overlay labels={center_overlay_labels.shape[0]}, "
@@ -621,13 +1019,19 @@ def evaluate_space(
             f"Shape mismatch for {tag}: contour overlay labels={contour_overlay_labels.shape[0]}, "
             f"embeddings={embeddings.shape[0]}"
         )
+    if category_ids is not None and category_ids.shape[0] != embeddings.shape[0]:
+        raise ValueError(f"Shape mismatch for {tag}: category_ids={category_ids.shape[0]}, embeddings={embeddings.shape[0]}")
+    if superclass_ids is not None and superclass_ids.shape[0] != embeddings.shape[0]:
+        raise ValueError(f"Shape mismatch for {tag}: superclass_ids={superclass_ids.shape[0]}, embeddings={embeddings.shape[0]}")
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"\n[{tag}] Computing recall@k and precision@k...")
-    recall, precision, clipped_k = compute_retrieval_metrics_at_k(
+    print(f"\n[{tag}] Computing recall@k, precision@k, and neighborhood purity...")
+    recall, precision, neighborhood_purity, clipped_k = compute_retrieval_and_purity_at_k(
         embeddings=embeddings,
-        labels=labels,
+        labels_eval=labels_eval,
+        category_ids=category_ids,
+        superclass_ids=superclass_ids,
         k_list=args.rank_k,
         device=device,
         batch_size=args.batch_size,
@@ -648,7 +1052,7 @@ def evaluate_space(
         for k in args.rank_k:
             f.write(f"Precision@{k}: {precision[k]:.4f}\n")
 
-    payload = {
+    payload: dict[str, Any] = {
         "tag": tag,
         "embedding_mode": embedding_mode,
         "num_samples": int(embeddings.shape[0]),
@@ -658,7 +1062,57 @@ def evaluate_space(
         "precision": {str(k): float(v) for k, v in precision.items()},
         "clipped_k": clipped_k,
         "bits_left": compute_bits_left_stats(embeddings),
+        "neighborhood_purity": {str(k): v for k, v in neighborhood_purity.items()} if neighborhood_purity else None,
     }
+
+    emb_norm = _normalize_embeddings(embeddings)
+
+    # Extended metrics require both category and superclass labels.
+    if category_ids is not None and superclass_ids is not None:
+        adv_dir = output_dir / "advanced_metrics"
+        adv_dir.mkdir(parents=True, exist_ok=True)
+
+        category_cov = compute_covariance_summary(
+            emb_norm=emb_norm,
+            labels=category_ids,
+            out_csv=adv_dir / "intra_category_covariance.csv",
+            label_col_name="category_id",
+        )
+        superclass_cov = compute_covariance_summary(
+            emb_norm=emb_norm,
+            labels=superclass_ids,
+            out_csv=adv_dir / "intra_superclass_covariance.csv",
+            label_col_name="superclass_id",
+        )
+
+        angular_summary = compute_angular_distance_analysis(
+            emb_norm=emb_norm,
+            category_ids=category_ids,
+            out_dir=adv_dir,
+        )
+
+        max_requested_k = max(int(k) for k in args.rank_k if int(k) > 0)
+        margin_summary = compute_margin_analysis(
+            emb_norm=emb_norm,
+            category_ids=category_ids,
+            superclass_ids=superclass_ids,
+            out_dir=adv_dir,
+            ann_candidates=int(args.ann_candidates),
+            max_k=max_requested_k,
+        )
+
+        payload["covariance"] = {
+            "intra_category": category_cov,
+            "intra_superclass": superclass_cov,
+        }
+        payload["angular_distance_to_own_category_center"] = angular_summary
+        payload["margins"] = margin_summary
+    else:
+        payload["covariance"] = None
+        payload["angular_distance_to_own_category_center"] = None
+        payload["margins"] = None
+        print(f"[{tag}] Skipping covariance/angular/margin metrics: requires both category_ids and superclass_ids.")
+
     with open(metrics_path, "w") as f:
         json.dump(payload, f, indent=2)
 
@@ -667,17 +1121,15 @@ def evaluate_space(
     print(f"[{tag}] Saved: {metrics_path}")
 
     precompute_tail = (not args.skip_tsne) or (not args.skip_tail_analysis)
-    emb_norm = None
     classes = None
     class_centers = None
     own_class_sim = None
     tail_indices_global = np.array([], dtype=np.int64)
 
     if precompute_tail:
-        emb_norm = _normalize_embeddings(embeddings)
-        classes, class_centers, own_class_sim = compute_class_centers(emb_norm, labels)
+        classes, class_centers, own_class_sim = compute_class_centers(emb_norm, labels_eval)
         tail_indices_global = get_tail_sample_indices(
-            labels=labels,
+            labels=labels_eval,
             own_class_sim=own_class_sim,
             classes=classes,
             tail_samples_per_class=args.tail_samples_per_class,
@@ -687,7 +1139,7 @@ def evaluate_space(
         print(f"\n[{tag}] Computing match/non-match distribution...")
         match_sims, nonmatch_sims = compute_match_nonmatch_distribution(
             embeddings=embeddings,
-            labels=labels,
+            labels=labels_eval,
             device=device,
             block_size=args.block_size,
         )
@@ -701,7 +1153,7 @@ def evaluate_space(
         print(f"\n[{tag}] Running t-SNE (n={n_tsne})...")
         x_2d, y_sub, idx_used = run_tsne(
             embeddings,
-            labels,
+            labels_eval,
             perplexity=args.tsne_perplexity,
             subsample=subsample,
         )
@@ -744,16 +1196,15 @@ def evaluate_space(
             print(f"\n[{tag}] Skipping tail analysis: no image paths available.")
         else:
             print(f"\n[{tag}] Computing per-class tail sample analysis...")
-            if emb_norm is None or classes is None or class_centers is None or own_class_sim is None:
-                emb_norm = _normalize_embeddings(embeddings)
-                classes, class_centers, own_class_sim = compute_class_centers(emb_norm, labels)
+            if classes is None or class_centers is None or own_class_sim is None:
+                classes, class_centers, own_class_sim = compute_class_centers(emb_norm, labels_eval)
 
             intra_path = output_dir / "intra_class_similarity_stats.csv"
-            save_intra_class_stats(labels, own_class_sim, classes, intra_path)
+            save_intra_class_stats(labels_eval, own_class_sim, classes, intra_path)
 
             generate_tail_sample_analysis(
                 emb_norm=emb_norm,
-                labels=labels,
+                labels=labels_eval,
                 image_paths=image_paths,
                 classes=classes,
                 class_centers=class_centers,
@@ -766,7 +1217,7 @@ def evaluate_space(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="CSN inference with retrieval metrics and advanced analysis")
+    parser = argparse.ArgumentParser(description="Image-only CSN inference with extended evaluation")
 
     parser.add_argument("--embeddings", type=Path, default=None)
     parser.add_argument("--labels", type=Path, default=None)
@@ -774,7 +1225,7 @@ def parse_args() -> argparse.Namespace:
         "--prefix-metadata",
         type=Path,
         default=None,
-        help="Metadata json from generate_csn_embeddings.py; evaluates 4 spaces by default.",
+        help="Metadata json from generate_csn_embeddings_image.py",
     )
 
     parser.add_argument("--image-paths", type=Path, default=None, help="Optional .npy/.npz/.txt aligned image paths")
@@ -782,6 +1233,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rank-k", type=int, nargs="+", default=[1, 5, 10, 100, 1000])
     parser.add_argument("--batch-size", type=int, default=512)
     parser.add_argument("--block-size", type=int, default=2000)
+    parser.add_argument("--ann-candidates", type=int, default=2048, help="Candidate pool size for sklearn margin search")
 
     parser.add_argument("--tsne-subsample", type=int, default=5000, help="0 => all points")
     parser.add_argument("--tsne-perplexity", type=float, default=30.0)
@@ -792,7 +1244,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tail-samples-per-class", type=int, default=20)
 
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "mps", "cpu"])
-    parser.add_argument("--output-dir", type=Path, default=Path("./csn_inference_output"))
+    parser.add_argument("--output-dir", type=Path, default=Path("./csn_inference_output_image"))
     return parser.parse_args()
 
 
@@ -813,8 +1265,6 @@ def main() -> None:
         paths = {
             "image_super": Path(outputs["image_super"]),
             "image_category": Path(outputs["image_category"]),
-            "text_super": Path(outputs["text_super"]),
-            "text_category": Path(outputs["text_category"]),
             "superclass_ids": Path(outputs["superclass_ids"]),
             "category_ids": Path(outputs["category_ids"]),
             "paths": Path(outputs["paths"]) if "paths" in outputs else None,
@@ -822,7 +1272,10 @@ def main() -> None:
 
         image_paths = None
         if args.image_paths is not None:
-            image_paths = [str(x) for x in load_array(args.image_paths).flatten().tolist()] if args.image_paths.suffix.lower() in {".npy", ".npz"} else [ln.strip() for ln in args.image_paths.read_text().splitlines() if ln.strip()]
+            if args.image_paths.suffix.lower() in {".npy", ".npz"}:
+                image_paths = [str(x) for x in load_array(args.image_paths).flatten().tolist()]
+            else:
+                image_paths = [ln.strip() for ln in args.image_paths.read_text().splitlines() if ln.strip()]
         elif paths["paths"] is not None and paths["paths"].exists():
             image_paths = [str(x) for x in load_array(paths["paths"]).flatten().tolist()]
 
@@ -832,8 +1285,6 @@ def main() -> None:
         embedding_spaces = [
             ("image_super", paths["image_super"]),
             ("image_category", paths["image_category"]),
-            ("text_super", paths["text_super"]),
-            ("text_category", paths["text_category"]),
         ]
         label_sets = [
             ("superclass_ids", superclass_ids),
@@ -843,25 +1294,26 @@ def main() -> None:
         for emb_tag, emb_path in embedding_spaces:
             embeddings = load_array(emb_path).astype(np.float32)
             embedding_mode = "masked" if emb_tag.endswith("category") else "unmasked"
-            for label_tag, labels in label_sets:
+            for label_tag, labels_eval in label_sets:
                 tag = f"{emb_tag}__eval_{label_tag}"
                 center_overlay_labels = category_ids
                 center_overlay_name = "Category Centers"
                 contour_overlay_labels = None
                 contour_overlay_name = "Superclass 90% contours"
 
-                # For category-id evaluation views, show superclass mass regions.
                 if label_tag == "category_ids":
                     contour_overlay_labels = superclass_ids
 
                 evaluate_space(
                     embeddings=embeddings,
-                    labels=labels,
+                    labels_eval=labels_eval,
                     args=args,
                     device=device,
                     output_dir=args.output_dir / tag,
                     tag=tag,
                     image_paths=image_paths,
+                    category_ids=category_ids,
+                    superclass_ids=superclass_ids,
                     center_overlay_labels=center_overlay_labels,
                     center_overlay_name=center_overlay_name,
                     contour_overlay_labels=contour_overlay_labels,
@@ -881,12 +1333,14 @@ def main() -> None:
 
         evaluate_space(
             embeddings=embeddings,
-            labels=labels,
+            labels_eval=labels,
             args=args,
             device=device,
             output_dir=args.output_dir,
             tag="single",
             image_paths=image_paths,
+            category_ids=None,
+            superclass_ids=None,
             embedding_mode="unknown",
         )
 

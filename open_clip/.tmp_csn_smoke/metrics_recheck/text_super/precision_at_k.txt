@@ -1,2 +1,0 @@
-Precision@1: 1.0000
-Precision@5: 1.0000

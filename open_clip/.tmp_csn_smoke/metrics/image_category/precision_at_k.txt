@@ -1,3 +1,0 @@
-Precision@1: 0.6250
-Precision@5: 0.3125
-Precision@10: 0.1688

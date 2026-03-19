@@ -3,7 +3,7 @@
 Train CLIP-frozen visual-only CSN pipeline.
 
 - Superclass similarity on full projection embeddings.
-- Category similarity on shared-mask CSN embeddings.
+- Subclass similarity on shared-mask CSN embeddings.
 - Visual branch only: CLIP image encoder -> projection head -> shared CSN mask.
 """
 
@@ -23,6 +23,7 @@ from typing import Any
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
@@ -43,16 +44,17 @@ from csn_pipeline.model import ProjectionHead, SharedCSNMask
 class LossBundle:
     total: float
     super_simclr: float
-    cat_simclr: float
+    subclass_simclr: float
 
 
 @dataclass
 class TrainState:
     epoch: int
-    best_metric: float
-    best_epoch: int
+    best_subclass_metric: float
+    best_subclass_epoch: int
+    best_subclass_metrics: dict[str, Any]
     train_history: list[dict[str, Any]]
-    test_history: list[dict[str, Any]]
+    val_history: list[dict[str, Any]]
 
 
 class CSNIndexMultiViewDataset(Dataset):
@@ -155,6 +157,103 @@ def default_split_dir_for_csv(csv_file: str | Path, seed: int, train_ratio: floa
     return csv_path.parent / f"{csv_path.stem}_splits_seed{int(seed)}_tr{ratio_tag}"
 
 
+def create_or_load_balanced_validation_split(
+    records,
+    test_indices: np.ndarray,
+    split_dir: str | Path,
+    seed: int,
+    force_resplit: bool = False,
+    samples_per_subclass: int | None = None,
+    min_samples_per_subclass: int = 2,
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    split_dir = Path(split_dir)
+    split_dir.mkdir(parents=True, exist_ok=True)
+
+    val_path = split_dir / "val_indices_balanced.npy"
+    holdout_path = split_dir / "holdout_test_indices.npy"
+    meta_path = split_dir / "val_split_metadata.json"
+
+    if val_path.exists() and holdout_path.exists() and meta_path.exists() and not force_resplit:
+        val_idx = np.load(val_path).astype(np.int64)
+        holdout_idx = np.load(holdout_path).astype(np.int64)
+        with open(meta_path, "r") as f:
+            meta = json.load(f)
+
+        max_idx = len(records) - 1
+        if val_idx.size == 0:
+            raise ValueError("Existing validation split is empty.")
+        if int(val_idx.max()) > max_idx or (holdout_idx.size > 0 and int(holdout_idx.max()) > max_idx):
+            raise ValueError("Existing validation split indices exceed current record count. Use --force-resplit.")
+        return val_idx, holdout_idx, meta
+
+    rng = random.Random(seed + 17)
+    test_indices = np.asarray(test_indices, dtype=np.int64)
+    by_subclass: dict[int, list[int]] = {}
+    for idx in test_indices.tolist():
+        by_subclass.setdefault(int(records[int(idx)].category_id), []).append(int(idx))
+
+    eligible = {sid: idxs for sid, idxs in by_subclass.items() if len(idxs) >= int(min_samples_per_subclass)}
+    if not eligible:
+        raise ValueError(
+            f"No test subclasses have at least {int(min_samples_per_subclass)} samples for balanced validation."
+        )
+
+    min_count = min(len(idxs) for idxs in eligible.values())
+    if samples_per_subclass is None:
+        samples_per_subclass = int(min_count)
+    else:
+        samples_per_subclass = int(samples_per_subclass)
+        if samples_per_subclass < int(min_samples_per_subclass):
+            raise ValueError("--val-samples-per-subclass must be >= --val-min-samples-per-subclass")
+        samples_per_subclass = min(samples_per_subclass, int(min_count))
+
+    val_idx: list[int] = []
+    holdout_idx: list[int] = []
+    excluded_subclasses = 0
+    excluded_samples = 0
+
+    for subclass_id, idxs in sorted(by_subclass.items(), key=lambda x: x[0]):
+        shuffled = list(int(i) for i in idxs)
+        rng.shuffle(shuffled)
+        if len(shuffled) < int(min_samples_per_subclass):
+            excluded_subclasses += 1
+            excluded_samples += len(shuffled)
+            holdout_idx.extend(shuffled)
+            continue
+
+        chosen = shuffled[:samples_per_subclass]
+        remainder = shuffled[samples_per_subclass:]
+        val_idx.extend(chosen)
+        holdout_idx.extend(remainder)
+
+    val_idx_np = np.asarray(sorted(val_idx), dtype=np.int64)
+    holdout_idx_np = np.asarray(sorted(holdout_idx), dtype=np.int64)
+    if val_idx_np.size == 0:
+        raise ValueError("Balanced validation split produced zero samples.")
+
+    meta = {
+        "seed": int(seed),
+        "source_test_count": int(test_indices.shape[0]),
+        "val_count": int(val_idx_np.shape[0]),
+        "holdout_test_count": int(holdout_idx_np.shape[0]),
+        "num_subclasses_total": int(len(by_subclass)),
+        "num_subclasses_in_validation": int(len(eligible)),
+        "excluded_singleton_subclasses": int(excluded_subclasses),
+        "excluded_singleton_samples": int(excluded_samples),
+        "samples_per_subclass": int(samples_per_subclass),
+        "min_samples_per_subclass": int(min_samples_per_subclass),
+        "val_indices_path": str(val_path),
+        "holdout_test_indices_path": str(holdout_path),
+    }
+
+    np.save(val_path, val_idx_np)
+    np.save(holdout_path, holdout_idx_np)
+    with open(meta_path, "w") as f:
+        json.dump(meta, f, indent=2)
+
+    return val_idx_np, holdout_idx_np, meta
+
+
 def _records_path_hash(records) -> str:
     h = hashlib.sha1()
     for rec in records:
@@ -230,6 +329,137 @@ def load_or_build_clip_image_cache(
     return features
 
 
+def collect_subclass_embeddings(
+    clip_feature_cache: torch.Tensor,
+    records,
+    indices: np.ndarray,
+    image_head: torch.nn.Module,
+    subclass_head: torch.nn.Module | None,
+    batch_size: int = 512,
+) -> tuple[np.ndarray, np.ndarray]:
+    device = next(image_head.parameters()).device
+    idx_np = np.asarray(indices, dtype=np.int64)
+    embeddings: list[np.ndarray] = []
+    subclass_ids: list[int] = []
+
+    with torch.no_grad():
+        for start in range(0, idx_np.shape[0], batch_size):
+            batch_idx = idx_np[start : start + batch_size]
+            idx_tensor = torch.from_numpy(batch_idx).long()
+            feat = clip_feature_cache.index_select(0, idx_tensor).to(
+                device=device,
+                dtype=torch.float32,
+                non_blocking=True,
+            )
+            proj = image_head(feat)
+            emb = subclass_head(proj) if subclass_head is not None else proj
+            embeddings.append(emb.float().cpu().numpy())
+            subclass_ids.extend(int(records[int(i)].category_id) for i in batch_idx.tolist())
+
+    return np.vstack(embeddings).astype(np.float32), np.asarray(subclass_ids, dtype=np.int64)
+
+
+def compute_retrieval_metrics_at_k(
+    embeddings: np.ndarray,
+    labels_eval: np.ndarray,
+    k_list: list[int],
+    device: torch.device,
+    batch_size: int = 512,
+) -> tuple[dict[int, float], dict[int, float], dict[int, float], list[int]]:
+    emb = torch.from_numpy(np.asarray(embeddings, dtype=np.float32)).to(device)
+    emb = F.normalize(emb, dim=1)
+    labels_t = torch.from_numpy(np.asarray(labels_eval, dtype=np.int64)).to(device)
+    n = emb.shape[0]
+
+    if n < 2:
+        raise ValueError("Need at least 2 validation samples for retrieval metrics.")
+
+    requested_k = sorted(set(int(k) for k in k_list if int(k) > 0))
+    if not requested_k:
+        raise ValueError("k_list must contain at least one positive integer.")
+
+    max_allowed_k = n - 1
+    max_k = max(min(k, max_allowed_k) for k in requested_k)
+
+    recall_hits = {k: 0 for k in requested_k}
+    precision_sum = {k: 0.0 for k in requested_k}
+
+    for i in range(0, n, batch_size):
+        end = min(i + batch_size, n)
+        query = emb[i:end]
+        query_labels = labels_t[i:end]
+        sim = query @ emb.T
+        for j in range(sim.shape[0]):
+            sim[j, i + j] = float("-inf")
+        topk_idx = torch.topk(sim, max_k, dim=1).indices
+        retrieved_labels = labels_t[topk_idx]
+        same = retrieved_labels == query_labels.unsqueeze(1)
+
+        for k_req in requested_k:
+            kk = min(k_req, max_allowed_k)
+            top_same = same[:, :kk]
+            recall_hits[k_req] += int(top_same.any(dim=1).sum().item())
+            precision_sum[k_req] += float(top_same.float().mean(dim=1).sum().item())
+
+    recall = {k: recall_hits[k] / n for k in requested_k}
+    precision = {k: precision_sum[k] / n for k in requested_k}
+    f1 = {
+        k: (0.0 if (precision[k] + recall[k]) <= 0 else 2.0 * precision[k] * recall[k] / (precision[k] + recall[k]))
+        for k in requested_k
+    }
+    clipped_k = sorted(k for k in requested_k if k > max_allowed_k)
+    return precision, recall, f1, clipped_k
+
+
+def summarize_subclass_retrieval(
+    clip_feature_cache: torch.Tensor,
+    records,
+    val_indices: np.ndarray,
+    image_head: torch.nn.Module,
+    subclass_head: torch.nn.Module | None,
+    device: torch.device,
+    k_values: list[int],
+    batch_size: int = 512,
+) -> dict[str, Any]:
+    embeddings, subclass_ids = collect_subclass_embeddings(
+        clip_feature_cache=clip_feature_cache,
+        records=records,
+        indices=val_indices,
+        image_head=image_head,
+        subclass_head=subclass_head,
+        batch_size=batch_size,
+    )
+    precision, recall, f1, clipped_k = compute_retrieval_metrics_at_k(
+        embeddings=embeddings,
+        labels_eval=subclass_ids,
+        k_list=k_values,
+        device=device,
+        batch_size=batch_size,
+    )
+    f1_mean = float(np.mean([f1[k] for k in sorted(f1)]))
+    return {
+        "subclass_precision_at_k": {str(k): float(v) for k, v in precision.items()},
+        "subclass_recall_at_k": {str(k): float(v) for k, v in recall.items()},
+        "subclass_f1_at_k": {str(k): float(v) for k, v in f1.items()},
+        "subclass_f1_mean": f1_mean,
+        "clipped_k": [int(k) for k in clipped_k],
+        "num_validation_samples": int(val_indices.shape[0]),
+    }
+
+
+def rename_user_facing_terms(obj: Any) -> Any:
+    if isinstance(obj, dict):
+        return {rename_user_facing_terms(k): rename_user_facing_terms(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [rename_user_facing_terms(v) for v in obj]
+    if isinstance(obj, str):
+        out = obj.replace("category", "subclass").replace("Category", "Subclass")
+        out = out.replace("w_cat_", "w_subclass_").replace("_cat_", "_subclass_")
+        out = out.replace("cat_", "subclass_")
+        return out
+    return obj
+
+
 def compute_losses(
     clip_feature_cache: torch.Tensor,
     batch: dict[str, torch.Tensor],
@@ -267,7 +497,7 @@ def compute_losses(
 
     parts = {
         "super_simclr": l_super_simclr,
-        "cat_simclr": l_cat_simclr,
+        "subclass_simclr": l_cat_simclr,
     }
     return total, parts
 
@@ -293,12 +523,12 @@ def run_epoch(
     else:
         image_head.eval()
         csn_mask.eval()
-        mode = f"Test {epoch}/{total_epochs}"
+        mode = f"Validation {epoch}/{total_epochs}"
 
     running = {
         "total": 0.0,
         "super_simclr": 0.0,
-        "cat_simclr": 0.0,
+        "subclass_simclr": 0.0,
     }
     n_batches = 0
 
@@ -330,7 +560,7 @@ def run_epoch(
                     optimizer.step()
 
         running["total"] += float(total.item())
-        for k in ("super_simclr", "cat_simclr"):
+        for k in ("super_simclr", "subclass_simclr"):
             running[k] += float(parts[k].item())
         n_batches += 1
 
@@ -342,7 +572,7 @@ def run_epoch(
     return LossBundle(
         total=running["total"] / n_batches,
         super_simclr=running["super_simclr"] / n_batches,
-        cat_simclr=running["cat_simclr"] / n_batches,
+        subclass_simclr=running["subclass_simclr"] / n_batches,
     )
 
 
@@ -370,10 +600,11 @@ def save_checkpoint(
         "scaler_state_dict": scaler.state_dict() if scaler is not None else None,
         "train_state": {
             "epoch": train_state.epoch,
-            "best_metric": train_state.best_metric,
-            "best_epoch": train_state.best_epoch,
+            "best_subclass_metric": train_state.best_subclass_metric,
+            "best_subclass_epoch": train_state.best_subclass_epoch,
+            "best_subclass_metrics": train_state.best_subclass_metrics,
             "train_history": train_state.train_history,
-            "test_history": train_state.test_history,
+            "val_history": train_state.val_history,
         },
         "split_dir": str(args.split_dir) if args.split_dir else None,
         "seed": int(args.seed),
@@ -394,17 +625,19 @@ def save_loss_log(out_dir: Path, train_state: TrainState) -> None:
     with open(log_path, "w") as f:
         json.dump(
             {
-                "best_metric": train_state.best_metric,
-                "best_epoch": train_state.best_epoch,
+                "best_subclass_metric_name": "subclass_f1_mean",
+                "best_subclass_metric": train_state.best_subclass_metric,
+                "best_subclass_epoch": train_state.best_subclass_epoch,
+                "best_subclass_metrics": train_state.best_subclass_metrics,
                 "train_history": train_state.train_history,
-                "test_history": train_state.test_history,
+                "val_history": train_state.val_history,
             },
             f,
             indent=2,
         )
 
 
-def plot_loss_curves(out_dir: Path, train_history: list[dict[str, Any]], test_history: list[dict[str, Any]]) -> None:
+def plot_loss_curves(out_dir: Path, train_history: list[dict[str, Any]], val_history: list[dict[str, Any]]) -> None:
     if not train_history:
         return
 
@@ -413,20 +646,52 @@ def plot_loss_curves(out_dir: Path, train_history: list[dict[str, Any]], test_hi
     train_total = [x["total"] for x in train_history]
     plt.plot(train_epochs, train_total, label="train_total", linewidth=2)
 
-    if test_history:
-        test_epochs = [x["epoch"] for x in test_history]
-        test_total = [x["total"] for x in test_history]
-        plt.plot(test_epochs, test_total, label="test_total", linewidth=2)
+    if val_history:
+        val_epochs = [x["epoch"] for x in val_history]
+        val_total = [x["total"] for x in val_history]
+        plt.plot(val_epochs, val_total, label="validation_total", linewidth=2)
 
     plt.xlabel("Epoch")
     plt.ylabel("Loss")
-    plt.title("CSN training/test loss")
+    plt.title("CSN training/validation loss")
     plt.grid(alpha=0.3)
     plt.legend()
     plt.tight_layout()
     out_path = out_dir / "loss_curve.png"
     plt.savefig(out_path, dpi=150)
     plt.close()
+
+
+def plot_subclass_retrieval_curves(
+    out_dir: Path,
+    val_history: list[dict[str, Any]],
+    k_values: list[int],
+) -> None:
+    if not val_history:
+        return
+
+    epochs = [int(row["epoch"]) for row in val_history]
+    metric_specs = [
+        ("subclass_precision_at_k", "Validation subclass precision@k"),
+        ("subclass_recall_at_k", "Validation subclass recall@k"),
+        ("subclass_f1_at_k", "Validation subclass F1@k"),
+    ]
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5), sharex=True)
+    for ax, (metric_key, title) in zip(axes, metric_specs):
+        for k in k_values:
+            vals = [float(row.get(metric_key, {}).get(str(k), 0.0)) for row in val_history]
+            ax.plot(epochs, vals, marker="o", linewidth=1.8, label=f"k={k}")
+        ax.set_title(title)
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("Score")
+        ax.set_ylim(0.0, 1.05)
+        ax.grid(alpha=0.3)
+        ax.legend()
+
+    fig.tight_layout()
+    fig.savefig(out_dir / "subclass_retrieval_metrics.png", dpi=150)
+    plt.close(fig)
 
 
 def parse_args() -> argparse.Namespace:
@@ -462,6 +727,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-every", type=int, default=1)
     parser.add_argument("--save-every", type=int, default=1)
     parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--val-samples-per-subclass", type=int, default=None)
+    parser.add_argument("--val-min-samples-per-subclass", type=int, default=2)
+    parser.add_argument("--val-metric-batch-size", type=int, default=512)
 
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "mps", "cpu"])
     parser.add_argument("--amp", action="store_true")
@@ -508,7 +776,24 @@ def main() -> None:
         force_resplit=args.force_resplit,
         train_ratio=train_ratio,
     )
-    print(f"Loaded records: {len(records)}  train={len(train_idx)} test={len(test_idx)}")
+    val_idx, holdout_test_idx, val_split_meta = create_or_load_balanced_validation_split(
+        records=records,
+        test_indices=test_idx,
+        split_dir=args.split_dir,
+        seed=args.seed,
+        force_resplit=args.force_resplit,
+        samples_per_subclass=args.val_samples_per_subclass,
+        min_samples_per_subclass=args.val_min_samples_per_subclass,
+    )
+    print(
+        f"Loaded records: {len(records)}  train={len(train_idx)} test={len(test_idx)} "
+        f"validation={len(val_idx)} holdout_test={len(holdout_test_idx)}"
+    )
+    print(
+        "Balanced validation split: "
+        f"subclasses={val_split_meta['num_subclasses_in_validation']}  "
+        f"samples_per_subclass={val_split_meta['samples_per_subclass']}"
+    )
 
     # model and CLIP cache
     model, preprocess = clip.load(args.model, device=device, jit=False)
@@ -545,7 +830,7 @@ def main() -> None:
         print("Note: --w-super-it and --w-cat-it are ignored in visual-only mode.")
 
     train_ds = CSNIndexMultiViewDataset(records=records, indices=train_idx, seed=args.seed)
-    test_ds = CSNIndexMultiViewDataset(records=records, indices=test_idx, seed=args.seed + 1)
+    val_ds = CSNIndexMultiViewDataset(records=records, indices=val_idx, seed=args.seed + 1)
 
     pin_memory = device.type == "cuda"
     generator = torch.Generator()
@@ -560,8 +845,8 @@ def main() -> None:
         collate_fn=collate_csn_index_batch,
         generator=generator,
     )
-    test_loader = DataLoader(
-        test_ds,
+    val_loader = DataLoader(
+        val_ds,
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
@@ -585,7 +870,15 @@ def main() -> None:
         "w_cat_simclr": float(args.w_cat_simclr),
     }
 
-    state = TrainState(epoch=0, best_metric=float("inf"), best_epoch=0, train_history=[], test_history=[])
+    k_values = [1, 10, 100, 1000]
+    state = TrainState(
+        epoch=0,
+        best_subclass_metric=float("-inf"),
+        best_subclass_epoch=0,
+        best_subclass_metrics={},
+        train_history=[],
+        val_history=[],
+    )
     start_epoch = 1
 
     if args.resume:
@@ -608,28 +901,32 @@ def main() -> None:
         ts_data = ckpt.get("train_state", {})
         state = TrainState(
             epoch=int(ts_data.get("epoch", ckpt.get("epoch", 0))),
-            best_metric=float(ts_data.get("best_metric", float("inf"))),
-            best_epoch=int(ts_data.get("best_epoch", 0)),
+            best_subclass_metric=float(ts_data.get("best_subclass_metric", float("-inf"))),
+            best_subclass_epoch=int(ts_data.get("best_subclass_epoch", 0)),
+            best_subclass_metrics=dict(ts_data.get("best_subclass_metrics", {})),
             train_history=list(ts_data.get("train_history", [])),
-            test_history=list(ts_data.get("test_history", [])),
+            val_history=list(ts_data.get("val_history", ts_data.get("test_history", []))),
         )
         start_epoch = int(ckpt.get("epoch", 0)) + 1
         print(f"Resumed from {resume_path} at epoch {start_epoch}")
 
     # save static config now
     config = {
-        "args": vars(args),
+        "args": rename_user_facing_terms(vars(args)),
         "device": str(device),
         "amp_enabled": use_amp,
         "data_stats": data_stats,
         "split_meta": split_meta,
+        "val_split_meta": val_split_meta,
         "img_embed_dim": img_dim,
         "visual_only": True,
         "clip_image_cache_path": str(cache_path),
-        "ignored_weights": {
+        "validation_k_values": k_values,
+        "best_subclass_selection_metric": "subclass_f1_mean",
+        "ignored_weights": rename_user_facing_terms({
             "w_super_it": float(args.w_super_it),
             "w_cat_it": float(args.w_cat_it),
-        },
+        }),
     }
     with open(exp_dir / "config.json", "w") as f:
         json.dump(config, f, indent=2)
@@ -655,10 +952,10 @@ def main() -> None:
         state.train_history.append(train_row)
 
         do_eval = (epoch % args.eval_every == 0) or (epoch == args.epochs)
-        metric_for_best = train_loss.total
+        metric_for_best = float("-inf")
         if do_eval:
-            test_loss = run_epoch(
-                loader=test_loader,
+            val_loss = run_epoch(
+                loader=val_loader,
                 clip_feature_cache=clip_feature_cache,
                 image_head=image_head,
                 csn_mask=csn_mask,
@@ -671,14 +968,25 @@ def main() -> None:
                 epoch=epoch,
                 total_epochs=args.epochs,
             )
-            test_row = {"epoch": epoch, **asdict(test_loss)}
-            state.test_history.append(test_row)
-            metric_for_best = test_loss.total
+            subclass_metrics = summarize_subclass_retrieval(
+                clip_feature_cache=clip_feature_cache,
+                records=records,
+                val_indices=val_idx,
+                image_head=image_head,
+                subclass_head=csn_mask,
+                device=device,
+                k_values=k_values,
+                batch_size=args.val_metric_batch_size,
+            )
+            val_row = {"epoch": epoch, **asdict(val_loss), **subclass_metrics}
+            state.val_history.append(val_row)
+            metric_for_best = float(subclass_metrics["subclass_f1_mean"])
 
-        is_best = metric_for_best < state.best_metric
+        is_best = metric_for_best > state.best_subclass_metric
         if is_best:
-            state.best_metric = metric_for_best
-            state.best_epoch = epoch
+            state.best_subclass_metric = metric_for_best
+            state.best_subclass_epoch = epoch
+            state.best_subclass_metrics = dict(state.val_history[-1]) if state.val_history else {}
 
         state.epoch = epoch
 
@@ -696,18 +1004,30 @@ def main() -> None:
             )
 
         save_loss_log(exp_dir, state)
-        plot_loss_curves(exp_dir, state.train_history, state.test_history)
+        plot_loss_curves(exp_dir, state.train_history, state.val_history)
+        plot_subclass_retrieval_curves(exp_dir, state.val_history, k_values)
 
         dt = time.perf_counter() - t0
+        latest_val = state.val_history[-1] if state.val_history else None
+        val_summary = ""
+        if latest_val is not None:
+            val_summary = (
+                f" val_subclass_f1_mean={float(latest_val['subclass_f1_mean']):.4f}"
+                f" best_subclass_epoch={state.best_subclass_epoch}"
+                f" best_subclass_f1_mean={state.best_subclass_metric:.4f}"
+            )
         print(
             f"Epoch {epoch}/{args.epochs} "
             f"train_total={train_loss.total:.4f} "
-            f"best_metric={state.best_metric:.4f} "
+            f"train_subclass_simclr={train_loss.subclass_simclr:.4f}"
+            f"{val_summary} "
             f"time={dt:.1f}s"
         )
 
     print("Training complete")
-    print(f"Best epoch: {state.best_epoch}  best_metric={state.best_metric:.4f}")
+    print(f"Best subclass epoch: {state.best_subclass_epoch}  best_subclass_f1_mean={state.best_subclass_metric:.4f}")
+    if state.best_subclass_metrics:
+        print(f"Best subclass metrics by k: {json.dumps(state.best_subclass_metrics['subclass_f1_at_k'], sort_keys=True)}")
     print(f"Artifacts: {exp_dir}")
 
 
